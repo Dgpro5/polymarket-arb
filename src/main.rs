@@ -55,6 +55,7 @@ impl Candle {
 #[derive(Debug, Clone)]
 struct MarketInfo {
     slug: String,
+    end_ts: i64,  // Unix seconds when this window closes
     condition_id: String,
     asset_ids: Vec<String>,
     outcomes: Vec<String>,
@@ -136,47 +137,73 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Main loop: reconnect on socket errors. When the market expires mid-session
-    // (signalled by NO NEW ASSETS), re-discover the new active market.
-    let mut current_market = market;
+    // Main loop: re-discover the active market on every iteration.
+    // We race run_socket against a timer that fires at window expiry so that
+    // even if the server goes completely silent (no close, no error, no
+    // NO NEW ASSETS) we still switch to the next window on time.
     let mut backoff = 2u64;
     loop {
-        let result = run_socket(Arc::clone(&state), &current_market.asset_ids).await;
-        match result {
-            Err(e) if e.to_string().contains("NO NEW ASSETS") => {
-                eprintln!("Market expired. Discovering next active market in {backoff}s...");
-                tokio::time::sleep(Duration::from_secs(backoff)).await;
-                match discover_active_btc_5m_market(&client).await {
-                    Ok(new_market) => {
-                        println!("Switched to new market: {}", new_market.slug);
-                        // Update shared state with new market info.
-                        let mut guard = state.lock().await;
-                        guard.market_slug = new_market.slug.clone();
-                        guard.condition_id = new_market.condition_id.clone();
-                        guard.asset_to_outcome = new_market
-                            .asset_ids
-                            .iter()
-                            .cloned()
-                            .zip(new_market.outcomes.iter().cloned())
-                            .collect();
-                        guard.candles.clear();
-                        drop(guard);
-                        current_market = new_market;
-                        backoff = 2;
+        match discover_active_btc_5m_market(&client).await {
+            Ok(new_market) => {
+                println!("Connecting to market: {}", new_market.slug);
+
+                // Compute how many seconds remain in this window.
+                let now_secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                let secs_remaining = (new_market.end_ts - now_secs).max(1) as u64;
+                println!("Window expires in {secs_remaining}s");
+
+                {
+                    let mut guard = state.lock().await;
+                    guard.market_slug = new_market.slug.clone();
+                    guard.condition_id = new_market.condition_id.clone();
+                    guard.asset_to_outcome = new_market
+                        .asset_ids
+                        .iter()
+                        .cloned()
+                        .zip(new_market.outcomes.iter().cloned())
+                        .collect();
+                    guard.candles.clear();
+                }
+
+                // Race the socket against the window expiry timer.
+                // Whichever fires first wins — either way we loop and re-discover.
+                tokio::select! {
+                    result = run_socket(Arc::clone(&state), &new_market.asset_ids) => {
+                        match result {
+                            Ok(_) => {
+                                println!("Socket closed cleanly, re-discovering...");
+                                backoff = 2;
+                            }
+                            Err(e) if e.to_string().contains("NO NEW ASSETS") => {
+                                println!("Market ended (NO NEW ASSETS), re-discovering...");
+                                backoff = 2;
+                            }
+                            Err(e) => {
+                                eprintln!("Socket error: {e:#}. Reconnecting in {backoff}s...");
+                                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                                backoff = (backoff * 2).min(60);
+                            }
+                        }
                     }
-                    Err(e) => {
-                        eprintln!("Failed to discover new market: {e:#}. Retrying in {backoff}s...");
-                        backoff = (backoff * 2).min(60);
+                    _ = tokio::time::sleep(Duration::from_secs(secs_remaining)) => {
+                        // Window timer fired — server went silent. Wait a few seconds
+                        // to ensure we're clearly past the boundary before re-discovering,
+                        // in case the timer fired slightly early due to sleep precision.
+                        println!("Window expiry timer fired, waiting for boundary...");
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        println!("Switching to next market...");
+                        backoff = 2;
                     }
                 }
             }
-            Err(err) => {
-                eprintln!("Socket error: {err:#}. Reconnecting in {backoff}s...");
+            Err(e) => {
+                // New window may not be listed on the API yet (takes a few seconds).
+                eprintln!("Market discovery failed: {e:#}. Retrying in {backoff}s...");
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
-                backoff = (backoff * 2).min(60);
-            }
-            Ok(_) => {
-                backoff = 2;
+                backoff = (backoff * 2).min(10);
             }
         }
     }
@@ -184,147 +211,111 @@ async fn main() -> Result<()> {
 
 /// Finds the currently active BTC up/down 5-minute market by querying the
 /// Gamma API, then picking the one whose expiry is soonest but still future.
+/// Computes the slug for the currently active BTC 5-minute window.
+///
+/// Polymarket rolls a new market every 5 minutes. The slug is always:
+///   btc-updown-5m-<unix_seconds>
+/// where <unix_seconds> is the window's END time rounded up to the next
+/// multiple of 300.
+///
+/// Example: now = 06:07 UTC  →  window ends 06:10  →  suffix = that timestamp
+fn compute_current_slug() -> (String, i64) {
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    // Polymarket slugs use the END time of the 5-minute window.
+    // e.g. now = 06:07  →  window ends 06:10  →  slug = btc-updown-5m-<06:10 ts>
+// Round down to the current 5-minute window end (removes +300s).
+let remainder = now_secs % 300;
+let end_ts = now_secs - remainder;
+
+    (format!("btc-updown-5m-{end_ts}"), end_ts)
+}
+
+/// Fetches the currently active BTC 5-minute market by computing its slug
+/// deterministically from the current time, then fetching it from the Gamma API.
 async fn discover_active_btc_5m_market(client: &Client) -> Result<MarketInfo> {
-    println!("Discovering active BTC 5-minute market...");
+    let (slug, end_ts) = compute_current_slug();
+    println!("Computed active market slug: {slug} (window ends at Unix {end_ts})");
 
-    let url = format!(
-        "{GAMMA_API}/markets?slug_contains=btc-updown-5m&active=true&closed=false&limit=20"
-    );
-
+    let url = format!("{GAMMA_API}/markets?slug={slug}");
     let resp = client
         .get(&url)
         .send()
         .await
-        .context("fetch active btc-updown-5m markets")?;
+        .context("fetch btc-updown-5m market by slug")?;
 
-    let data: Value = resp
-        .json()
-        .await
-        .context("parse active markets response")?;
+    let data: Value = resp.json().await.context("parse market response")?;
 
-    let markets = data
+    let market = data
         .as_array()
-        .ok_or_else(|| anyhow!("expected array from gamma API"))?;
+        .and_then(|arr| arr.first())
+        .ok_or_else(|| {
+            anyhow!(
+                "Market not found for slug '{slug}'. \
+                 It may not be listed yet — wait a few seconds and retry. \
+                 Verify at: https://polymarket.com/event/{slug}"
+            )
+        })?;
 
-    if markets.is_empty() {
-        return discover_active_btc_5m_market_fallback(client).await;
-    }
-
-    println!("Found {} active candidate market(s)", markets.len());
-
-    let now = now_ms();
-    // Pick the market that expires soonest but hasn't expired yet.
-    // If none are in the future, pick the one with the largest (most recent) expiry.
-    let mut best: Option<(i64, &Value)> = None;
-
-    for market in markets.iter() {
-        let slug = market
-            .get("slug")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-
-        // The slug format is: btc-updown-5m-<unix_seconds>
-        let expiry_ms = slug
-            .rsplit('-')
-            .next()
-            .and_then(|s| s.parse::<i64>().ok())
-            .map(|secs| secs * 1000)
-            .unwrap_or(0);
-
-        let is_future = expiry_ms > now;
-        println!("  Candidate slug={slug}, expiry_ms={expiry_ms}, is_future={is_future}");
-
-        // Score: future markets get their expiry as score (prefer sooner),
-        // expired markets get 0.
-        let score = if is_future { expiry_ms } else { 0 };
-        let is_better = match best {
-            None => true,
-            Some((prev_score, _)) => {
-                // Prefer any future over expired, then prefer sooner future.
-                (score > 0 && prev_score == 0) || (score > 0 && score < prev_score)
-            }
-        };
-        if is_better {
-            best = Some((score, market));
-        }
-    }
-
-    let chosen = best
-        .map(|(_, m)| m)
-        .ok_or_else(|| anyhow!("no suitable active btc-updown-5m market found"))?;
-
-    let slug = chosen
-        .get("slug")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-
-    println!("Selected market slug: {slug}");
-    let mut info = parse_market_info(chosen)?;
+    let mut info = parse_market_info(market)?;
     info.slug = slug;
+    info.end_ts = end_ts;
     Ok(info)
 }
 
-/// Fallback discovery when active=true filter returns nothing.
-/// Fetches all btc-updown-5m markets and picks the one closest to now.
-async fn discover_active_btc_5m_market_fallback(client: &Client) -> Result<MarketInfo> {
-    println!("Trying fallback market discovery (no active filter)...");
-    let url = format!("{GAMMA_API}/markets?slug_contains=btc-updown-5m&limit=20");
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .context("fetch btc-updown-5m markets (fallback)")?;
-    let data: Value = resp.json().await.context("parse fallback markets response")?;
-    let markets = data
-        .as_array()
-        .ok_or_else(|| anyhow!("expected array from gamma API (fallback)"))?;
+fn parse_market_info(market: &Value) -> Result<MarketInfo> {
+    let condition_id = market
+        .get("conditionId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("missing conditionId"))?
+        .to_string();
 
-    if markets.is_empty() {
+    let asset_ids = parse_string_array(market.get("clobTokenIds"))
+        .context("parse clobTokenIds")?;
+    let outcomes = parse_string_array(market.get("outcomes"))
+        .context("parse outcomes")?;
+
+    if asset_ids.is_empty() || outcomes.is_empty() {
+        return Err(anyhow!("empty outcomes or token ids"));
+    }
+    if asset_ids.len() != outcomes.len() {
         return Err(anyhow!(
-            "No btc-updown-5m markets found at all. \
-             Check https://gamma-api.polymarket.com/markets?slug_contains=btc-updown-5m \
-             to verify the naming is still correct."
+            "token id count {} does not match outcomes {}",
+            asset_ids.len(),
+            outcomes.len()
         ));
     }
 
-    let now = now_ms();
-    // Pick the market whose expiry timestamp (from slug) is closest to now.
-    let mut best: Option<(i64, &Value)> = None;
-    for market in markets.iter() {
-        let slug = market
-            .get("slug")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        let expiry_ms = slug
-            .rsplit('-')
-            .next()
-            .and_then(|s| s.parse::<i64>().ok())
-            .map(|secs| secs * 1000)
-            .unwrap_or(0);
+    Ok(MarketInfo {
+        slug: String::new(), // filled in by caller after slug is known
+        end_ts: 0,           // filled in by caller after slug is known
+        condition_id,
+        asset_ids,
+        outcomes,
+    })
+}
 
-        let diff = (expiry_ms - now).abs();
-        match best {
-            None => best = Some((diff, market)),
-            Some((prev_diff, _)) if diff < prev_diff => best = Some((diff, market)),
-            _ => {}
-        }
+fn parse_string_array(value: Option<&Value>) -> Result<Vec<String>> {
+    let Some(value) = value else {
+        return Err(anyhow!("missing field"));
+    };
+
+    if let Some(arr) = value.as_array() {
+        return Ok(arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect());
     }
 
-    let chosen = best
-        .map(|(_, m)| m)
-        .ok_or_else(|| anyhow!("no market found in fallback"))?;
+    if let Some(s) = value.as_str() {
+        let parsed: Vec<String> = serde_json::from_str(s).context("parse json string array")?;
+        return Ok(parsed);
+    }
 
-    let slug = chosen
-        .get("slug")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-
-    println!("Fallback selected slug: {slug}");
-    let mut info = parse_market_info(chosen)?;
-    info.slug = slug;
-    Ok(info)
+    Err(anyhow!("unexpected field type"))
 }
 
 async fn run_socket(state: Arc<Mutex<MarketState>>, asset_ids: &[String]) -> Result<()> {
