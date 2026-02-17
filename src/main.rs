@@ -17,6 +17,7 @@ const CANDLE_MS: i64 = 5 * 60 * 1000;
 const DATA_DIR: &str = "data";
 const LATEST_PATH: &str = "data/btc_updown_5m_latest.json";
 const CSV_PATH: &str = "data/btc_updown_5m_candles.csv";
+const DISCORD_WEBHOOK_URL: &str = "https://discord.com/api/webhooks/1473284259363164211/4sgTuuoGlwS4OyJ5x6-QmpPA_Q1gvsIZB9EZrb9zWX6qyA0LMQklz3IupBfINPVnpsMZ";
 
 #[derive(Debug, Clone)]
 struct Candle {
@@ -225,13 +226,14 @@ fn compute_current_slug() -> (String, i64) {
         .unwrap_or_default()
         .as_secs() as i64;
 
-    // Polymarket slugs use the END time of the 5-minute window.
-    // e.g. now = 06:07  →  window ends 06:10  →  slug = btc-updown-5m-<06:10 ts>
-// Round down to the current 5-minute window end (removes +300s).
-let remainder = now_secs % 300;
-let end_ts = now_secs - remainder;
+    // The slug uses the START of the 5-minute window (floor to nearest 300s).
+    // e.g. now = 06:07  →  start = 06:05  →  slug = btc-updown-5m-<06:05 ts>
+    // end_ts = start + 300 is used only for the expiry timer, not the slug.
+    let remainder = now_secs % 300;
+    let start_ts = now_secs - remainder;
+    let end_ts = start_ts + 300;
 
-    (format!("btc-updown-5m-{end_ts}"), end_ts)
+    (format!("btc-updown-5m-{start_ts}"), end_ts)
 }
 
 /// Fetches the currently active BTC 5-minute market by computing its slug
@@ -573,11 +575,11 @@ async fn update_outcome_price(
         write_candle_csv(&guard, asset_id, prev)?;
     }
 
-    print_up_down(&guard);
+    print_up_down(&guard).await?;
     Ok(())
 }
 
-fn print_up_down(state: &MarketState) {
+async fn print_up_down(state: &MarketState) -> Result<()> {
     let mut up = None;
     let mut down = None;
     let mut ts = None;
@@ -600,13 +602,15 @@ fn print_up_down(state: &MarketState) {
     if let (Some(up), Some(down)) = (up, down) {
         let sum_cents = (up + down) * 100.0;
         if sum_cents <= 97.5 {
-            println!(
+            let message = format!(
                 "Arbitrage opportunity: up={:.4}, down={:.4}, sum_cents={:.2}, ts={}",
                 up,
                 down,
                 sum_cents,
                 ts.unwrap_or(0)
             );
+            println!("{message}");
+            send_discord_webhook(&message).await?;
         } else {
             println!(
                 "Price update: up={:.4}, down={:.4}, sum_cents={:.2}, ts={}",
@@ -617,6 +621,8 @@ fn print_up_down(state: &MarketState) {
             );
         }
     }
+
+    Ok(())
 }
 
 fn write_candle_csv(state: &MarketState, asset_id: &str, candle: &Candle) -> Result<()> {
@@ -658,6 +664,22 @@ fn write_candle_csv(state: &MarketState, asset_id: &str, candle: &Candle) -> Res
 
 fn parse_price(raw: &str) -> Option<f64> {
     raw.parse::<f64>().ok()
+}
+
+async fn send_discord_webhook(message: &str) -> Result<()> {
+    if DISCORD_WEBHOOK_URL.trim().is_empty() {
+        return Ok(());
+    }
+
+    let client = Client::new();
+    let payload = json!({ "content": message });
+    client
+        .post(DISCORD_WEBHOOK_URL)
+        .json(&payload)
+        .send()
+        .await
+        .context("send discord webhook")?;
+    Ok(())
 }
 
 fn parse_timestamp(value: Option<&Value>) -> Option<i64> {
