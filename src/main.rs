@@ -70,12 +70,24 @@ struct MarketState {
     candles: HashMap<String, Candle>,
 }
 
+struct MoneyManager {
+    money_spent: f64,
+    total_buy_positions: i64,
+    total_sell_positions: i64,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     fs::create_dir_all(DATA_DIR).context("create data dir")?;
 
     let client = Client::new();
 
+    // init money manager
+    let money: Arc<Mutex<MoneyManager>> = Arc::new(Mutex::new(MoneyManager {
+        money_spent: 0.0,
+        total_buy_positions: 0,
+        total_sell_positions: 0,
+    }));
     // Discover the currently active BTC 5-minute market dynamically.
     // These markets expire every 5 minutes, so we must never hardcode the slug.
     let market = discover_active_btc_5m_market(&client).await?;
@@ -171,16 +183,22 @@ async fn main() -> Result<()> {
 
                 // Race the socket against the window expiry timer.
                 // Whichever fires first wins — either way we loop and re-discover.
+                let mut window_closed = false;
+                let mut close_reason = "unknown";
                 tokio::select! {
-                    result = run_socket(Arc::clone(&state), &new_market.asset_ids) => {
+                    result = run_socket(Arc::clone(&state), Arc::clone(&money), &new_market.asset_ids) => {
                         match result {
                             Ok(_) => {
                                 println!("Socket closed cleanly, re-discovering...");
                                 backoff = 2;
+                                window_closed = true;
+                                close_reason = "socket_closed";
                             }
                             Err(e) if e.to_string().contains("NO NEW ASSETS") => {
                                 println!("Market ended (NO NEW ASSETS), re-discovering...");
                                 backoff = 2;
+                                window_closed = true;
+                                close_reason = "no_new_assets";
                             }
                             Err(e) => {
                                 eprintln!("Socket error: {e:#}. Reconnecting in {backoff}s...");
@@ -197,7 +215,13 @@ async fn main() -> Result<()> {
                         tokio::time::sleep(Duration::from_secs(3)).await;
                         println!("Switching to next market...");
                         backoff = 2;
+                        window_closed = true;
+                        close_reason = "timer";
                     }
+                }
+
+                if window_closed {
+                    send_money_snapshot(&money, close_reason).await?;
                 }
             }
             Err(e) => {
@@ -320,7 +344,11 @@ fn parse_string_array(value: Option<&Value>) -> Result<Vec<String>> {
     Err(anyhow!("unexpected field type"))
 }
 
-async fn run_socket(state: Arc<Mutex<MarketState>>, asset_ids: &[String]) -> Result<()> {
+async fn run_socket(
+    state: Arc<Mutex<MarketState>>,
+    money: Arc<Mutex<MoneyManager>>,
+    asset_ids: &[String],
+) -> Result<()> {
     let (ws_stream, _) = connect_async(CLOB_WS_URL).await.context("connect clob ws")?;
     let (mut write, mut read) = ws_stream.split();
     println!("Connected to CLOB WS {CLOB_WS_URL}");
@@ -353,8 +381,8 @@ async fn run_socket(state: Arc<Mutex<MarketState>>, asset_ids: &[String]) -> Res
                     _ => {}
                 }
 
-                if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                    handle_clob_message(&state, &value).await?;
+                        if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                            handle_clob_message(&state, &money, &value).await?;
                 } else {
                     eprintln!("Unrecognised WS message: {text}");
                 }
@@ -374,10 +402,14 @@ async fn run_socket(state: Arc<Mutex<MarketState>>, asset_ids: &[String]) -> Res
     Ok(())
 }
 
-async fn handle_clob_message(state: &Arc<Mutex<MarketState>>, value: &Value) -> Result<()> {
+async fn handle_clob_message(
+    state: &Arc<Mutex<MarketState>>,
+    money: &Arc<Mutex<MoneyManager>>,
+    value: &Value,
+) -> Result<()> {
     if let Some(arr) = value.as_array() {
         for item in arr {
-            handle_clob_message_single(state, item).await?;
+            handle_clob_message_single(state, money, item).await?;
         }
         return Ok(());
     }
@@ -385,20 +417,21 @@ async fn handle_clob_message(state: &Arc<Mutex<MarketState>>, value: &Value) -> 
     if let Some(data) = value.get("data") {
         if let Some(arr) = data.as_array() {
             for item in arr {
-                handle_clob_message_single(state, item).await?;
+                handle_clob_message_single(state, money, item).await?;
             }
             return Ok(());
         }
         if data.is_object() {
-            return handle_clob_message_single(state, data).await;
+            return handle_clob_message_single(state, money, data).await;
         }
     }
 
-    handle_clob_message_single(state, value).await
+    handle_clob_message_single(state, money, value).await
 }
 
 async fn handle_clob_message_single(
     state: &Arc<Mutex<MarketState>>,
+    money: &Arc<Mutex<MoneyManager>>,
     value: &Value,
 ) -> Result<()> {
     let Some(event_type) = value.get("event_type").and_then(|v| v.as_str()) else {
@@ -408,17 +441,17 @@ async fn handle_clob_message_single(
     match event_type {
         "best_bid_ask" => {
             if let Some((asset_id, price, ts)) = parse_best_bid_ask(value) {
-                update_outcome_price(state, &asset_id, price, ts).await?;
+                update_outcome_price(state, money, &asset_id, price, ts).await?;
             }
         }
         "last_trade_price" => {
             if let Some((asset_id, price, ts)) = parse_last_trade(value) {
-                update_outcome_price(state, &asset_id, price, ts).await?;
+                update_outcome_price(state, money, &asset_id, price, ts).await?;
             }
         }
         "book" => {
             if let Some((asset_id, price, ts)) = parse_book_mid(value) {
-                update_outcome_price(state, &asset_id, price, ts).await?;
+                update_outcome_price(state, money, &asset_id, price, ts).await?;
             }
         }
         "price_change" => {
@@ -431,7 +464,7 @@ async fn handle_clob_message_single(
                 if let Some(changes) = changes {
                     for change in changes {
                         if let Some((asset_id, price)) = parse_price_change(change, root_asset) {
-                            update_outcome_price(state, &asset_id, price, ts).await?;
+                            update_outcome_price(state, money, &asset_id, price, ts).await?;
                         }
                     }
                 }
@@ -541,6 +574,7 @@ fn parse_price_change(change: &Value, root_asset: Option<&str>) -> Option<(Strin
 
 async fn update_outcome_price(
     state: &Arc<Mutex<MarketState>>,
+    money: &Arc<Mutex<MoneyManager>>,
     asset_id: &str,
     price: f64,
     ts: i64,
@@ -575,11 +609,11 @@ async fn update_outcome_price(
         write_candle_csv(&guard, asset_id, prev)?;
     }
 
-    print_up_down(&guard).await?;
+    print_up_down(&guard, money).await?;
     Ok(())
 }
 
-async fn print_up_down(state: &MarketState) -> Result<()> {
+async fn print_up_down(state: &MarketState, money: &Arc<Mutex<MoneyManager>>) -> Result<()> {
     let mut up = None;
     let mut down = None;
     let mut ts = None;
@@ -610,6 +644,12 @@ async fn print_up_down(state: &MarketState) -> Result<()> {
                 ts.unwrap_or(0)
             );
             println!("{message}");
+            let mut money = money.lock().await;
+            // customize money updates here
+            let moneyupdate = &mut *money;
+            moneyupdate.money_spent += 100.0*up + 100.0*down; // 100 shares of up and down
+            moneyupdate.total_buy_positions += 100;
+            moneyupdate.total_sell_positions += 100;
             send_discord_webhook(&message).await?;
         } else {
             println!(
@@ -679,6 +719,21 @@ async fn send_discord_webhook(message: &str) -> Result<()> {
         .send()
         .await
         .context("send discord webhook")?;
+    Ok(())
+}
+
+async fn send_money_snapshot(money: &Arc<Mutex<MoneyManager>>, reason: &str) -> Result<()> {
+    let snapshot = {
+        let money = money.lock().await;
+        format!(
+            "Window closed ({reason}). money_spent={:.4}, total_buy_positions={}, total_sell_positions={}. Total PnL={:.4} (PnL is in cents)",
+            money.money_spent,
+            money.total_buy_positions,
+            money.total_sell_positions,
+            (money.total_buy_positions as f64) * 100.0 - money.money_spent // assuming all positions are closed at $1.00
+        )
+    };
+    send_discord_webhook(&snapshot).await?;
     Ok(())
 }
 
