@@ -2,3 +2,4 @@
 /data
 data/btc_updown_5m_latest.json
 data/btc_updown_5m_candles.csv
+/.env

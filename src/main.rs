@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -10,8 +11,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+use ethers::prelude::*;
+use ethers::signers::{LocalWallet, Signer};
+use ethers::utils::keccak256;
 
 const GAMMA_API: &str = "https://gamma-api.polymarket.com";
+const CLOB_API: &str = "https://clob.polymarket.com";
 const CLOB_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 const CANDLE_MS: i64 = 5 * 60 * 1000;
 const DATA_DIR: &str = "data";
@@ -19,6 +24,14 @@ const LATEST_PATH: &str = "data/btc_updown_5m_latest.json";
 const CSV_PATH: &str = "data/btc_updown_5m_candles.csv";
 const DISCORD_WEBHOOK_URL: &str = "https://discord.com/api/webhooks/1473284259363164211/4sgTuuoGlwS4OyJ5x6-QmpPA_Q1gvsIZB9EZrb9zWX6qyA0LMQklz3IupBfINPVnpsMZ";
 const DETECTION_COOLDOWN_MS: i64 = 500;
+
+// CRITICAL: Set your wallet private key here (without 0x prefix)
+// NEVER commit this to git - use environment variable in production
+const PRIVATE_KEY: &str = "YOUR_PRIVATE_KEY_HERE";
+
+// Trading parameters
+const MIN_PROFIT_THRESHOLD: f64 = 97.5; // sum_cents must be <= this to trade
+const SLIPPAGE_TOLERANCE: f64 = 0.02; // 2% slippage tolerance
 
 static LAST_DETECTION_MS: AtomicI64 = AtomicI64::new(0);
 
@@ -59,7 +72,7 @@ impl Candle {
 #[derive(Debug, Clone)]
 struct MarketInfo {
     slug: String,
-    end_ts: i64,  // Unix seconds when this window closes
+    end_ts: i64,
     condition_id: String,
     asset_ids: Vec<String>,
     outcomes: Vec<String>,
@@ -79,20 +92,77 @@ struct MoneyManager {
     total_sell_positions: i64,
 }
 
+#[derive(Debug, Clone)]
+struct TradingWallet {
+    wallet: LocalWallet,
+    address: Address,
+}
+
+impl TradingWallet {
+    fn new(private_key: &str) -> Result<Self> {
+        let wallet = private_key.parse::<LocalWallet>()
+            .context("parse private key")?;
+        let address = wallet.address();
+        println!("Trading wallet address: {:?}", address);
+        Ok(Self { wallet, address })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct OrderBookLevel {
+    price: String,
+    size: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrderBook {
+    bids: Vec<OrderBookLevel>,
+    asks: Vec<OrderBookLevel>,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateOrderPayload {
+    token_id: String,
+    price: String,
+    size: String,
+    side: String, // "BUY" or "SELL"
+    #[serde(rename = "type")]
+    order_type: String, // "GTC" = Good Till Cancelled
+    signature: String,
+    #[serde(rename = "signatureType")]
+    signature_type: u8, // 0 = EOA, 1 = POLY_PROXY, 2 = POLY_GNOSIS_SAFE
+}
+
+#[derive(Debug, Deserialize)]
+struct BalanceResponse {
+    #[serde(default)]
+    usdc: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     fs::create_dir_all(DATA_DIR).context("create data dir")?;
 
+    if PRIVATE_KEY == "YOUR_PRIVATE_KEY_HERE" {
+        eprintln!("ERROR: You must set PRIVATE_KEY constant before trading!");
+        eprintln!("Set it in the code or use environment variable");
+        return Err(anyhow!("Private key not configured"));
+    }
+
+    let wallet = Arc::new(TradingWallet::new(PRIVATE_KEY)?);
     let client = Client::new();
 
-    // init money manager
+    // Initialize money manager
     let money: Arc<Mutex<MoneyManager>> = Arc::new(Mutex::new(MoneyManager {
         money_spent: 0.0,
         total_buy_positions: 0,
         total_sell_positions: 0,
     }));
-    // Discover the currently active BTC 5-minute market dynamically.
-    // These markets expire every 5 minutes, so we must never hardcode the slug.
+
+    // Check initial balance
+    let balance = get_balance(&client, &wallet.address).await?;
+    println!("Initial USDC balance: ${}", balance);
+
     let market = discover_active_btc_5m_market(&client).await?;
 
     println!(
@@ -116,7 +186,7 @@ async fn main() -> Result<()> {
         candles: HashMap::new(),
     }));
 
-    // Background task: write latest snapshot to disk every second.
+    // Background task: write latest snapshot to disk every second
     let latest_task_state = Arc::clone(&state);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -153,17 +223,12 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Main loop: re-discover the active market on every iteration.
-    // We race run_socket against a timer that fires at window expiry so that
-    // even if the server goes completely silent (no close, no error, no
-    // NO NEW ASSETS) we still switch to the next window on time.
     let mut backoff = 2u64;
     loop {
         match discover_active_btc_5m_market(&client).await {
             Ok(new_market) => {
                 println!("Connecting to market: {}", new_market.slug);
 
-                // Compute how many seconds remain in this window.
                 let now_secs = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -184,12 +249,15 @@ async fn main() -> Result<()> {
                     guard.candles.clear();
                 }
 
-                // Race the socket against the window expiry timer.
-                // Whichever fires first wins — either way we loop and re-discover.
                 let mut window_closed = false;
                 let mut close_reason = "unknown";
                 tokio::select! {
-                    result = run_socket(Arc::clone(&state), Arc::clone(&money), &new_market.asset_ids) => {
+                    result = run_socket(
+                        Arc::clone(&state),
+                        Arc::clone(&money),
+                        Arc::clone(&wallet),
+                        &new_market.asset_ids
+                    ) => {
                         match result {
                             Ok(_) => {
                                 println!("Socket closed cleanly, re-discovering...");
@@ -211,9 +279,6 @@ async fn main() -> Result<()> {
                         }
                     }
                     _ = tokio::time::sleep(Duration::from_secs(secs_remaining)) => {
-                        // Window timer fired — server went silent. Wait a few seconds
-                        // to ensure we're clearly past the boundary before re-discovering,
-                        // in case the timer fired slightly early due to sleep precision.
                         println!("Window expiry timer fired, waiting for boundary...");
                         tokio::time::sleep(Duration::from_secs(3)).await;
                         println!("Switching to next market...");
@@ -228,7 +293,6 @@ async fn main() -> Result<()> {
                 }
             }
             Err(e) => {
-                // New window may not be listed on the API yet (takes a few seconds).
                 eprintln!("Market discovery failed: {e:#}. Retrying in {backoff}s...");
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
                 backoff = (backoff * 2).min(10);
@@ -237,25 +301,12 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Finds the currently active BTC up/down 5-minute market by querying the
-/// Gamma API, then picking the one whose expiry is soonest but still future.
-/// Computes the slug for the currently active BTC 5-minute window.
-///
-/// Polymarket rolls a new market every 5 minutes. The slug is always:
-///   btc-updown-5m-<unix_seconds>
-/// where <unix_seconds> is the window's END time rounded up to the next
-/// multiple of 300.
-///
-/// Example: now = 06:07 UTC  →  window ends 06:10  →  suffix = that timestamp
 fn compute_current_slug() -> (String, i64) {
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
 
-    // The slug uses the START of the 5-minute window (floor to nearest 300s).
-    // e.g. now = 06:07  →  start = 06:05  →  slug = btc-updown-5m-<06:05 ts>
-    // end_ts = start + 300 is used only for the expiry timer, not the slug.
     let remainder = now_secs % 300;
     let start_ts = now_secs - remainder;
     let end_ts = start_ts + 300;
@@ -263,8 +314,6 @@ fn compute_current_slug() -> (String, i64) {
     (format!("btc-updown-5m-{start_ts}"), end_ts)
 }
 
-/// Fetches the currently active BTC 5-minute market by computing its slug
-/// deterministically from the current time, then fetching it from the Gamma API.
 async fn discover_active_btc_5m_market(client: &Client) -> Result<MarketInfo> {
     let (slug, end_ts) = compute_current_slug();
     println!("Computed active market slug: {slug} (window ends at Unix {end_ts})");
@@ -319,8 +368,8 @@ fn parse_market_info(market: &Value) -> Result<MarketInfo> {
     }
 
     Ok(MarketInfo {
-        slug: String::new(), // filled in by caller after slug is known
-        end_ts: 0,           // filled in by caller after slug is known
+        slug: String::new(),
+        end_ts: 0,
         condition_id,
         asset_ids,
         outcomes,
@@ -350,13 +399,13 @@ fn parse_string_array(value: Option<&Value>) -> Result<Vec<String>> {
 async fn run_socket(
     state: Arc<Mutex<MarketState>>,
     money: Arc<Mutex<MoneyManager>>,
+    wallet: Arc<TradingWallet>,
     asset_ids: &[String],
 ) -> Result<()> {
     let (ws_stream, _) = connect_async(CLOB_WS_URL).await.context("connect clob ws")?;
     let (mut write, mut read) = ws_stream.split();
     println!("Connected to CLOB WS {CLOB_WS_URL}");
 
-    // Send ONE subscription message in the correct Polymarket CLOB format.
     let subscribe_msg = json!({
         "type": "market",
         "assets_ids": asset_ids
@@ -384,8 +433,8 @@ async fn run_socket(
                     _ => {}
                 }
 
-                        if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                            handle_clob_message(&state, &money, &value).await?;
+                if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                    handle_clob_message(&state, &money, &wallet, &value).await?;
                 } else {
                     eprintln!("Unrecognised WS message: {text}");
                 }
@@ -408,11 +457,12 @@ async fn run_socket(
 async fn handle_clob_message(
     state: &Arc<Mutex<MarketState>>,
     money: &Arc<Mutex<MoneyManager>>,
+    wallet: &Arc<TradingWallet>,
     value: &Value,
 ) -> Result<()> {
     if let Some(arr) = value.as_array() {
         for item in arr {
-            handle_clob_message_single(state, money, item).await?;
+            handle_clob_message_single(state, money, wallet, item).await?;
         }
         return Ok(());
     }
@@ -420,21 +470,22 @@ async fn handle_clob_message(
     if let Some(data) = value.get("data") {
         if let Some(arr) = data.as_array() {
             for item in arr {
-                handle_clob_message_single(state, money, item).await?;
+                handle_clob_message_single(state, money, wallet, item).await?;
             }
             return Ok(());
         }
         if data.is_object() {
-            return handle_clob_message_single(state, money, data).await;
+            return handle_clob_message_single(state, money, wallet, data).await;
         }
     }
 
-    handle_clob_message_single(state, money, value).await
+    handle_clob_message_single(state, money, wallet, value).await
 }
 
 async fn handle_clob_message_single(
     state: &Arc<Mutex<MarketState>>,
     money: &Arc<Mutex<MoneyManager>>,
+    wallet: &Arc<TradingWallet>,
     value: &Value,
 ) -> Result<()> {
     let Some(event_type) = value.get("event_type").and_then(|v| v.as_str()) else {
@@ -444,17 +495,17 @@ async fn handle_clob_message_single(
     match event_type {
         "best_bid_ask" => {
             if let Some((asset_id, price, ts)) = parse_best_bid_ask(value) {
-                update_outcome_price(state, money, &asset_id, price, ts).await?;
+                update_outcome_price(state, money, wallet, &asset_id, price, ts).await?;
             }
         }
         "last_trade_price" => {
             if let Some((asset_id, price, ts)) = parse_last_trade(value) {
-                update_outcome_price(state, money, &asset_id, price, ts).await?;
+                update_outcome_price(state, money, wallet, &asset_id, price, ts).await?;
             }
         }
         "book" => {
             if let Some((asset_id, price, ts)) = parse_book_mid(value) {
-                update_outcome_price(state, money, &asset_id, price, ts).await?;
+                update_outcome_price(state, money, wallet, &asset_id, price, ts).await?;
             }
         }
         "price_change" => {
@@ -467,7 +518,7 @@ async fn handle_clob_message_single(
                 if let Some(changes) = changes {
                     for change in changes {
                         if let Some((asset_id, price)) = parse_price_change(change, root_asset) {
-                            update_outcome_price(state, money, &asset_id, price, ts).await?;
+                            update_outcome_price(state, money, wallet, &asset_id, price, ts).await?;
                         }
                     }
                 }
@@ -578,6 +629,7 @@ fn parse_price_change(change: &Value, root_asset: Option<&str>) -> Option<(Strin
 async fn update_outcome_price(
     state: &Arc<Mutex<MarketState>>,
     money: &Arc<Mutex<MoneyManager>>,
+    wallet: &Arc<TradingWallet>,
     asset_id: &str,
     price: f64,
     ts: i64,
@@ -612,13 +664,19 @@ async fn update_outcome_price(
         write_candle_csv(&guard, asset_id, prev)?;
     }
 
-    print_up_down(&guard, money).await?;
+    print_up_down(&guard, money, wallet).await?;
     Ok(())
 }
 
-async fn print_up_down(state: &MarketState, money: &Arc<Mutex<MoneyManager>>) -> Result<()> {
-    let mut up = None;
-    let mut down = None;
+async fn print_up_down(
+    state: &MarketState,
+    money: &Arc<Mutex<MoneyManager>>,
+    wallet: &Arc<TradingWallet>,
+) -> Result<()> {
+    let mut up_id = None;
+    let mut up_price = None;
+    let mut down_id = None;
+    let mut down_price = None;
     let mut ts = None;
 
     for (asset_id, candle) in state.candles.iter() {
@@ -628,50 +686,273 @@ async fn print_up_down(state: &MarketState, money: &Arc<Mutex<MoneyManager>>) ->
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
         if outcome.eq_ignore_ascii_case("up") {
-            up = Some(candle.last_price);
+            up_id = Some(asset_id.clone());
+            up_price = Some(candle.last_price);
             ts = Some(candle.last_update_ms);
         } else if outcome.eq_ignore_ascii_case("down") {
-            down = Some(candle.last_price);
+            down_id = Some(asset_id.clone());
+            down_price = Some(candle.last_price);
             ts = Some(candle.last_update_ms);
         }
     }
 
-    if let (Some(up), Some(down)) = (up, down) {
+    if let (Some(up), Some(down), Some(up_asset), Some(down_asset)) = 
+        (up_price, down_price, up_id, down_id) {
         let sum_cents = (up + down) * 100.0;
-        if sum_cents <= 97.5 {
+        
+        if sum_cents <= MIN_PROFIT_THRESHOLD {
             let now = now_ms();
             let last = LAST_DETECTION_MS.load(Ordering::Relaxed);
             if now - last < DETECTION_COOLDOWN_MS {
                 return Ok(());
             }
             LAST_DETECTION_MS.store(now, Ordering::Relaxed);
+            
             let message = format!(
                 "Arbitrage opportunity: up={:.4}, down={:.4}, sum_cents={:.2}, ts={}",
-                up,
-                down,
-                sum_cents,
-                ts.unwrap_or(0)
+                up, down, sum_cents, ts.unwrap_or(0)
             );
             println!("{message}");
-            let mut money = money.lock().await;
-            // customize money updates here
-            let moneyupdate = &mut *money;
-            moneyupdate.money_spent += 100.0*up + 100.0*down; // 100 shares of up and down
-            moneyupdate.total_buy_positions += 100;
-            moneyupdate.total_sell_positions += 100;
-            send_discord_webhook(&message).await?;
+            
+            // Execute the trade
+            match execute_arbitrage_trade(
+                wallet,
+                &up_asset,
+                &down_asset,
+                up,
+                down,
+                sum_cents
+            ).await {
+                Ok(trade_result) => {
+                    let mut money = money.lock().await;
+                    money.money_spent += trade_result.total_spent;
+                    money.total_buy_positions += trade_result.shares_bought as i64;
+                    money.total_sell_positions += trade_result.shares_bought as i64;
+                    
+                    let trade_msg = format!(
+                        "{}\nTRADE EXECUTED: {} shares @ up={:.4}, down={:.4}, total_spent=${:.2}",
+                        message,
+                        trade_result.shares_bought,
+                        up,
+                        down,
+                        trade_result.total_spent
+                    );
+                    send_discord_webhook(&trade_msg).await?;
+                }
+                Err(e) => {
+                    let error_msg = format!("{}\nTRADE FAILED: {:#}", message, e);
+                    eprintln!("{}", error_msg);
+                    send_discord_webhook(&error_msg).await?;
+                }
+            }
         } else {
             println!(
                 "Price update: up={:.4}, down={:.4}, sum_cents={:.2}, ts={}",
-                up,
-                down,
-                sum_cents,
-                ts.unwrap_or(0)
+                up, down, sum_cents, ts.unwrap_or(0)
             );
         }
     }
 
     Ok(())
+}
+
+#[derive(Debug)]
+struct TradeResult {
+    shares_bought: u64,
+    total_spent: f64,
+}
+
+async fn execute_arbitrage_trade(
+    wallet: &Arc<TradingWallet>,
+    up_asset_id: &str,
+    down_asset_id: &str,
+    up_price: f64,
+    down_price: f64,
+    _sum_cents: f64,
+) -> Result<TradeResult> {
+    let client = Client::new();
+    
+    // Step 1: Get order books for both assets
+    println!("Fetching order books...");
+    let up_book = get_order_book(&client, up_asset_id).await?;
+    let down_book = get_order_book(&client, down_asset_id).await?;
+    
+    // Step 2: Calculate optimal buy amount based on order book depth
+    let up_avg_size = calculate_average_size(&up_book.asks)?;
+    let down_avg_size = calculate_average_size(&down_book.asks)?;
+    
+    // Use the minimum of the two averages to avoid slippage
+    let max_size = up_avg_size.min(down_avg_size);
+    let buy_shares = (max_size * 0.8).floor() as u64; // Use 80% of max to be conservative
+    
+    println!("Order book analysis: up_avg={}, down_avg={}, buying {} shares",
+        up_avg_size, down_avg_size, buy_shares);
+    
+    if buy_shares == 0 {
+        return Err(anyhow!("Calculated buy amount is zero - insufficient liquidity"));
+    }
+    
+    // Step 3: Check balance
+    let balance = get_balance(&client, &wallet.address).await?;
+    let estimated_cost = (up_price + down_price) * (buy_shares as f64);
+    let required_balance = estimated_cost * (1.0 + SLIPPAGE_TOLERANCE);
+    
+    println!("Balance check: have ${}, need ${} (with {}% slippage buffer)",
+        balance, required_balance, SLIPPAGE_TOLERANCE * 100.0);
+    
+    if balance < required_balance {
+        return Err(anyhow!(
+            "Insufficient balance: have ${}, need ${} (shares={}, up={}, down={})",
+            balance, required_balance, buy_shares, up_price, down_price
+        ));
+    }
+    
+    // Step 4: Execute trades
+    println!("Placing orders...");
+    
+    // Buy UP shares
+    let up_order_id = place_market_order(
+        &client,
+        wallet,
+        up_asset_id,
+        buy_shares,
+        up_price,
+        "BUY"
+    ).await?;
+    println!("UP order placed: {}", up_order_id);
+    
+    // Buy DOWN shares
+    let down_order_id = place_market_order(
+        &client,
+        wallet,
+        down_asset_id,
+        buy_shares,
+        down_price,
+        "BUY"
+    ).await?;
+    println!("DOWN order placed: {}", down_order_id);
+    
+    let total_spent = estimated_cost;
+    
+    Ok(TradeResult {
+        shares_bought: buy_shares,
+        total_spent,
+    })
+}
+
+async fn get_order_book(client: &Client, token_id: &str) -> Result<OrderBook> {
+    let url = format!("{CLOB_API}/book?token_id={}", token_id);
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .context("fetch order book")?;
+    
+    let book: OrderBook = resp.json().await.context("parse order book")?;
+    Ok(book)
+}
+
+fn calculate_average_size(levels: &[OrderBookLevel]) -> Result<f64> {
+    if levels.is_empty() {
+        return Ok(0.0);
+    }
+    
+    let total_size: f64 = levels
+        .iter()
+        .take(5) // Consider top 5 levels
+        .filter_map(|level| level.size.parse::<f64>().ok())
+        .sum();
+    
+    let count = levels.iter().take(5).count() as f64;
+    if count == 0.0 {
+        return Ok(0.0);
+    }
+    
+    Ok(total_size / count)
+}
+
+async fn get_balance(client: &Client, address: &Address) -> Result<f64> {
+    let url = format!("{CLOB_API}/balances/{:?}", address);
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .context("fetch balance")?;
+    
+    let balance: BalanceResponse = resp.json().await.context("parse balance")?;
+    let usdc_balance = balance.usdc.parse::<f64>().unwrap_or(0.0);
+    Ok(usdc_balance / 1_000_000.0) // Convert from micro-USDC to USDC
+}
+
+async fn place_market_order(
+    client: &Client,
+    wallet: &Arc<TradingWallet>,
+    token_id: &str,
+    size: u64,
+    price: f64,
+    side: &str,
+) -> Result<String> {
+    // Create order parameters
+    let price_str = format!("{:.4}", price);
+    let size_str = size.to_string();
+    
+    // Sign the order (simplified - in production use proper EIP-712 signing)
+    let signature = sign_order(wallet, token_id, &price_str, &size_str, side).await?;
+    
+    let payload = CreateOrderPayload {
+        token_id: token_id.to_string(),
+        price: price_str,
+        size: size_str,
+        side: side.to_string(),
+        order_type: "GTC".to_string(),
+        signature,
+        signature_type: 0, // EOA signature
+    };
+    
+    let url = format!("{CLOB_API}/order");
+    let resp = client
+        .post(&url)
+        .json(&payload)
+        .send()
+        .await
+        .context("place order")?;
+    
+    if !resp.status().is_success() {
+        let error_text = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("Order placement failed: {}", error_text));
+    }
+    
+    let result: Value = resp.json().await.context("parse order response")?;
+    let order_id = result
+        .get("orderID")
+        .or_else(|| result.get("order_id"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("No order ID in response"))?
+        .to_string();
+    
+    Ok(order_id)
+}
+
+async fn sign_order(
+    wallet: &Arc<TradingWallet>,
+    token_id: &str,
+    price: &str,
+    size: &str,
+    side: &str,
+) -> Result<String> {
+    // Simplified signing - in production, use proper EIP-712 structured data signing
+    // This is a placeholder that creates a basic signature
+    let message = format!("{}:{}:{}:{}", token_id, price, size, side);
+    let message_hash = keccak256(message.as_bytes());
+    
+    // Note: This is simplified. Real Polymarket orders require EIP-712 signing
+    // with specific domain separator and structured data. You may need to use
+    // the py_clob_client's signing logic or implement full EIP-712.
+    let signature = wallet.wallet.sign_message(&message_hash)
+        .await
+        .map_err(|e| anyhow!("Signing failed: {}", e))?;
+    
+    Ok(format!("0x{}", hex::encode(signature.to_vec())))
 }
 
 fn write_candle_csv(state: &MarketState, asset_id: &str, candle: &Candle) -> Result<()> {
@@ -735,11 +1016,11 @@ async fn send_money_snapshot(money: &Arc<Mutex<MoneyManager>>, reason: &str) -> 
     let snapshot = {
         let money = money.lock().await;
         format!(
-            "Window closed ({reason}). money_spent={:.4}, total_buy_positions={}, total_sell_positions={}. Total PnL={:.4} (PnL is in cents)",
+            "Window closed ({reason}). money_spent={:.4}, total_buy_positions={}, total_sell_positions={}. Total PnL={:.4} (assuming all positions close at $1.00)",
             money.money_spent,
             money.total_buy_positions,
             money.total_sell_positions,
-            (money.total_buy_positions as f64) * 100.0 - money.money_spent // assuming all positions are closed at $1.00
+            (money.total_buy_positions as f64) * 100.0 - money.money_spent
         )
     };
     send_discord_webhook(&snapshot).await?;
