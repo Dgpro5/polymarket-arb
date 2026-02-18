@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicI64, Ordering}};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
@@ -18,6 +18,9 @@ const DATA_DIR: &str = "data";
 const LATEST_PATH: &str = "data/btc_updown_5m_latest.json";
 const CSV_PATH: &str = "data/btc_updown_5m_candles.csv";
 const DISCORD_WEBHOOK_URL: &str = "https://discord.com/api/webhooks/1473284259363164211/4sgTuuoGlwS4OyJ5x6-QmpPA_Q1gvsIZB9EZrb9zWX6qyA0LMQklz3IupBfINPVnpsMZ";
+const DETECTION_COOLDOWN_MS: i64 = 500;
+
+static LAST_DETECTION_MS: AtomicI64 = AtomicI64::new(0);
 
 #[derive(Debug, Clone)]
 struct Candle {
@@ -636,6 +639,12 @@ async fn print_up_down(state: &MarketState, money: &Arc<Mutex<MoneyManager>>) ->
     if let (Some(up), Some(down)) = (up, down) {
         let sum_cents = (up + down) * 100.0;
         if sum_cents <= 97.5 {
+            let now = now_ms();
+            let last = LAST_DETECTION_MS.load(Ordering::Relaxed);
+            if now - last < DETECTION_COOLDOWN_MS {
+                return Ok(());
+            }
+            LAST_DETECTION_MS.store(now, Ordering::Relaxed);
             let message = format!(
                 "Arbitrage opportunity: up={:.4}, down={:.4}, sum_cents={:.2}, ts={}",
                 up,
