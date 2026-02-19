@@ -123,32 +123,41 @@ struct OrderBook {
     asks: Vec<OrderBookLevel>,
 }
 
-// The EIP-712 order struct — all numeric fields are serialised as decimal strings
+// Order inner object — field names and types match Polymarket's documented payload exactly
 #[derive(Debug, Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct PolymarketOrderStruct {
-    salt: String,
+    // integer, NOT a string (matches the example: "salt": 1234567890)
+    salt: u64,
     maker: String,
     signer: String,
     taker: String,
+    // camelCase field names as required by the API
+    #[serde(rename = "tokenId")]
     token_id: String,
+    #[serde(rename = "makerAmount")]
     maker_amount: String,
+    #[serde(rename = "takerAmount")]
     taker_amount: String,
+    // string "BUY" or "SELL", not 0/1
+    side: String,
     expiration: String,
     nonce: String,
+    #[serde(rename = "feeRateBps")]
     fee_rate_bps: String,
-    side: u8,           // 0 = BUY, 1 = SELL
-    signature_type: u8, // 0 = EOA
     signature: String,
+    #[serde(rename = "signatureType")]
+    signature_type: u8, // 0 = EOA
 }
 
 // Wrapper sent to POST /order
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct CreateOrderRequest {
     order: PolymarketOrderStruct,
-    owner: String,       // apiKey from L2 credentials
-    order_type: String,  // "GTC"
+    owner: String,        // apiKey
+    #[serde(rename = "orderType")]
+    order_type: String,   // "GTC"
+    #[serde(rename = "deferExec")]
+    defer_exec: bool,     // false = execute immediately
 }
 
 // USDC contract on Polygon (6 decimals)
@@ -1255,30 +1264,32 @@ async fn place_market_order(
         salt,
     ).await?;
 
-    // Build the order struct
+    // Build the order struct — field types and values match the documented payload exactly
     let order = PolymarketOrderStruct {
-        salt: salt.to_string(),
+        salt,                                          // u64 integer, not a string
         maker: format!("{:#x}", wallet.address),
         signer: format!("{:#x}", wallet.address),
         taker: ZERO_ADDRESS.to_string(),
         token_id: token_id.to_string(),
         maker_amount: maker_amount.to_string(),
         taker_amount: taker_amount.to_string(),
+        side: side.to_string(),                        // "BUY" or "SELL" string, not 0/1
         expiration: "0".to_string(),
         nonce: "0".to_string(),
         fee_rate_bps: "0".to_string(),
-        side: side_uint,
-        signature_type: 0, // EOA
         signature,
+        signature_type: 0,                             // 0 = EOA
     };
 
     let request_body = CreateOrderRequest {
         order,
         owner: wallet.creds.api_key.clone(),
         order_type: "GTC".to_string(),
+        defer_exec: false,
     };
 
     let body_str = serde_json::to_string(&request_body).context("serialise order request")?;
+    println!("POST /order body: {body_str}");
 
     // L2 HMAC authentication headers
     let timestamp = now_ms() / 1000;
