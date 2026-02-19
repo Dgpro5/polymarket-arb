@@ -1,8 +1,11 @@
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use futures_util::{SinkExt, StreamExt};
+use hmac::{Hmac, Mac};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -12,6 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+use ethers::abi::{encode as abi_encode, Token};
 use ethers::prelude::*;
 use ethers::signers::{LocalWallet, Signer};
 use ethers::utils::keccak256;
@@ -95,19 +99,17 @@ struct MoneyManager {
 }
 
 #[derive(Debug, Clone)]
+struct ApiCredentials {
+    api_key: String,
+    secret: String,
+    passphrase: String,
+}
+
+#[derive(Debug, Clone)]
 struct TradingWallet {
     wallet: LocalWallet,
     address: Address,
-}
-
-impl TradingWallet {
-    fn new(private_key: &str) -> Result<Self> {
-        let wallet = private_key.parse::<LocalWallet>()
-            .context("parse private key")?;
-        let address = wallet.address();
-        println!("Trading wallet address: {:#x}", address);
-        Ok(Self { wallet, address })
-    }
+    creds: ApiCredentials,
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,22 +124,43 @@ struct OrderBook {
     asks: Vec<OrderBookLevel>,
 }
 
-#[derive(Debug, Serialize)]
-struct CreateOrderPayload {
+// The EIP-712 order struct — all numeric fields are serialised as decimal strings
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct PolymarketOrderStruct {
+    salt: String,
+    maker: String,
+    signer: String,
+    taker: String,
     token_id: String,
-    price: String,
-    size: String,
-    side: String, // "BUY" or "SELL"
-    #[serde(rename = "type")]
-    order_type: String, // "GTC" = Good Till Cancelled
+    maker_amount: String,
+    taker_amount: String,
+    expiration: String,
+    nonce: String,
+    fee_rate_bps: String,
+    side: u8,           // 0 = BUY, 1 = SELL
+    signature_type: u8, // 0 = EOA
     signature: String,
-    #[serde(rename = "signatureType")]
-    signature_type: u8, // 0 = EOA, 1 = POLY_PROXY, 2 = POLY_GNOSIS_SAFE
+}
+
+// Wrapper sent to POST /order
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateOrderRequest {
+    order: PolymarketOrderStruct,
+    owner: String,       // apiKey from L2 credentials
+    order_type: String,  // "GTC"
 }
 
 // USDC contract on Polygon (6 decimals)
 const USDC_POLYGON: &str = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359";
 const ANKR_API_KEY_ENV: &str = "ANKR_API_KEY";
+
+// Polymarket CTF Exchange on Polygon (non-neg-risk markets)
+const CTF_EXCHANGE_ADDRESS: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
+const CHAIN_ID: u64 = 137;
+// Zero address — any counterparty can fill the order
+const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -151,8 +174,21 @@ async fn main() -> Result<()> {
     if private_key.trim().is_empty() {
         return Err(anyhow!("'{PRIVATE_KEY_ENV}' is set but empty in .env"));
     }
-    let wallet = Arc::new(TradingWallet::new(private_key.trim())?);
+
     let client = Client::new();
+
+    // Parse the raw wallet so we can use it for L1 auth signing
+    let wallet_signer = private_key.trim().parse::<LocalWallet>()
+        .context("parse private key")?;
+    let address = wallet_signer.address();
+    println!("Trading wallet address: {:#x}", address);
+
+    // L1 auth: sign an EIP-712 message with the private key to obtain API credentials
+    notify_important("Obtaining Polymarket API credentials via L1 auth...").await?;
+    let creds = get_or_create_api_creds(&wallet_signer, address, &client).await?;
+    notify_important(&format!("API credentials ready. apiKey={}", creds.api_key)).await?;
+
+    let wallet = Arc::new(TradingWallet { wallet: wallet_signer, address, creds });
 
     // Initialize money manager
     let money: Arc<Mutex<MoneyManager>> = Arc::new(Mutex::new(MoneyManager {
@@ -988,6 +1024,175 @@ async fn get_balance(client: &Client, address: &Address) -> Result<f64> {
     Ok(raw_amount as f64 / 1_000_000.0)
 }
 
+// ── L1 EIP-712 Auth ─────────────────────────────────────────────────────────
+//
+// Signs the ClobAuth struct so we can call POST /auth/api-key and get
+// API credentials (apiKey, secret, passphrase).
+fn l1_auth_signature(wallet: &LocalWallet, address: Address, timestamp: i64, nonce: u64) -> Result<String> {
+    // Domain: EIP712Domain(string name,string version,uint256 chainId)
+    let domain_type_hash = keccak256(
+        b"EIP712Domain(string name,string version,uint256 chainId)"
+    );
+    let domain_separator = keccak256(&abi_encode(&[
+        Token::FixedBytes(domain_type_hash.to_vec()),
+        Token::FixedBytes(keccak256(b"ClobAuthDomain").to_vec()),
+        Token::FixedBytes(keccak256(b"1").to_vec()),
+        Token::Uint(U256::from(CHAIN_ID)),
+    ]));
+
+    // Struct: ClobAuth(address address,string timestamp,uint256 nonce,string message)
+    let type_hash = keccak256(
+        b"ClobAuth(address address,string timestamp,uint256 nonce,string message)"
+    );
+    let ts_str = timestamp.to_string();
+    let attestation = "This message attests that I control the given wallet";
+    let struct_hash = keccak256(&abi_encode(&[
+        Token::FixedBytes(type_hash.to_vec()),
+        Token::Address(address),
+        Token::FixedBytes(keccak256(ts_str.as_bytes()).to_vec()),
+        Token::Uint(U256::from(nonce)),
+        Token::FixedBytes(keccak256(attestation.as_bytes()).to_vec()),
+    ]));
+
+    // Final EIP-712 hash: "" || domainSeparator || structHash
+    let mut digest_input = Vec::with_capacity(66);
+    digest_input.extend_from_slice(b"");
+    digest_input.extend_from_slice(&domain_separator);
+    digest_input.extend_from_slice(&struct_hash);
+    let final_hash = keccak256(&digest_input);
+
+    // Sign raw hash (no personal-sign prefix)
+    let sig = wallet.sign_hash(H256::from(final_hash))
+        .map_err(|e| anyhow!("L1 sign_hash failed: {e}"))?;
+
+    let mut sig_bytes = [0u8; 65];
+    sig.r.to_big_endian(&mut sig_bytes[0..32]);
+    sig.s.to_big_endian(&mut sig_bytes[32..64]);
+    sig_bytes[64] = sig.v as u8;
+    Ok(format!("0x{}", hex::encode(sig_bytes)))
+}
+
+// ── L2 HMAC-SHA256 Auth ───────────────────────────────────────────────────────
+//
+// Produces the POLY_SIGNATURE header for authenticated CLOB API calls.
+// message = timestamp + METHOD + path + body
+fn l2_signature(secret: &str, timestamp: i64, method: &str, path: &str, body: &str) -> Result<String> {
+    let message = format!("{}{}{}{}", timestamp, method.to_uppercase(), path, body);
+    let secret_bytes = BASE64.decode(secret).context("decode L2 secret (not valid base64)")?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(&secret_bytes)
+        .map_err(|e| anyhow!("HMAC key error: {e}"))?;
+    mac.update(message.as_bytes());
+    Ok(BASE64.encode(mac.finalize().into_bytes()))
+}
+
+// ── Obtain/derive API credentials via L1 auth ─────────────────────────────────
+async fn get_or_create_api_creds(
+    wallet: &LocalWallet,
+    address: Address,
+    client: &Client,
+) -> Result<ApiCredentials> {
+    let timestamp = now_ms() / 1000; // seconds
+    let nonce = 0u64;
+    let signature = l1_auth_signature(wallet, address, timestamp, nonce)?;
+
+    // Try POST first (create); if credentials already exist the API returns them anyway
+    let resp = client
+        .post(format!("{CLOB_API}/auth/api-key"))
+        .header("POLY_ADDRESS", format!("{:#x}", address))
+        .header("POLY_SIGNATURE", &signature)
+        .header("POLY_TIMESTAMP", timestamp.to_string())
+        .header("POLY_NONCE", nonce.to_string())
+        .send()
+        .await
+        .context("L1 auth POST /auth/api-key")?;
+
+    let raw = resp.text().await.context("read L1 auth response")?;
+    let parsed: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parse L1 auth JSON: {raw}"))?;
+
+    let api_key = parsed.get("apiKey").and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("No apiKey in L1 auth response: {raw}"))?;
+    let secret = parsed.get("secret").and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("No secret in L1 auth response: {raw}"))?;
+    let passphrase = parsed.get("passphrase").and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("No passphrase in L1 auth response: {raw}"))?;
+
+    Ok(ApiCredentials {
+        api_key: api_key.to_string(),
+        secret: secret.to_string(),
+        passphrase: passphrase.to_string(),
+    })
+}
+
+// ── EIP-712 Order Signing ─────────────────────────────────────────────────────
+//
+// Signs the Polymarket CTF Exchange Order struct per EIP-712.
+// Returns hex-encoded signature string (0x-prefixed).
+fn eip712_order_signature(
+    wallet: &LocalWallet,
+    address: Address,
+    token_id: &str,
+    maker_amount: u128,
+    taker_amount: u128,
+    side: u8,
+    salt: u64,
+) -> Result<String> {
+    // Domain: EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)
+    let domain_type_hash = keccak256(
+        b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+    );
+    let exchange: Address = CTF_EXCHANGE_ADDRESS.parse().context("parse CTF exchange address")?;
+    let domain_separator = keccak256(&abi_encode(&[
+        Token::FixedBytes(domain_type_hash.to_vec()),
+        Token::FixedBytes(keccak256(b"Polymarket CTF Exchange").to_vec()),
+        Token::FixedBytes(keccak256(b"1").to_vec()),
+        Token::Uint(U256::from(CHAIN_ID)),
+        Token::Address(exchange),
+    ]));
+
+    // Order struct type hash
+    let order_type_hash = keccak256(
+        b"Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)"
+    );
+
+    let taker: Address = ZERO_ADDRESS.parse().context("parse zero address")?;
+    let token_id_uint = U256::from_dec_str(token_id)
+        .with_context(|| format!("parse tokenId '{token_id}' as U256"))?;
+
+    let struct_hash = keccak256(&abi_encode(&[
+        Token::FixedBytes(order_type_hash.to_vec()),
+        Token::Uint(U256::from(salt)),
+        Token::Address(address),                         // maker
+        Token::Address(address),                         // signer (same as maker for EOA)
+        Token::Address(taker),                           // taker = zero address
+        Token::Uint(token_id_uint),
+        Token::Uint(U256::from(maker_amount)),
+        Token::Uint(U256::from(taker_amount)),
+        Token::Uint(U256::zero()),                       // expiration = 0 (no expiry)
+        Token::Uint(U256::zero()),                       // nonce = 0
+        Token::Uint(U256::zero()),                       // feeRateBps = 0
+        Token::Uint(U256::from(side)),
+        Token::Uint(U256::zero()),                       // signatureType = 0 (EOA)
+    ]));
+
+    // Final EIP-712 digest
+    let mut digest_input = Vec::with_capacity(66);
+    digest_input.extend_from_slice(b"");
+    digest_input.extend_from_slice(&domain_separator);
+    digest_input.extend_from_slice(&struct_hash);
+    let final_hash = keccak256(&digest_input);
+
+    let sig = wallet.sign_hash(H256::from(final_hash))
+        .map_err(|e| anyhow!("order sign_hash failed: {e}"))?;
+
+    let mut sig_bytes = [0u8; 65];
+    sig.r.to_big_endian(&mut sig_bytes[0..32]);
+    sig.s.to_big_endian(&mut sig_bytes[32..64]);
+    sig_bytes[64] = sig.v as u8;
+    Ok(format!("0x{}", hex::encode(sig_bytes)))
+}
+
+// ── Place a market order with full L2 auth + EIP-712 signed order ─────────────
 async fn place_market_order(
     client: &Client,
     wallet: &Arc<TradingWallet>,
@@ -996,30 +1201,75 @@ async fn place_market_order(
     price: f64,
     side: &str,
 ) -> Result<String> {
-    let price_str = format!("{:.4}", price);
-    let size_str = size.to_string();
+    let side_uint: u8 = if side == "BUY" { 0 } else { 1 };
 
-    // FIX 5 (signing note): The sign_order function below uses a simplified keccak256
-    // of a plain string. Polymarket's CLOB API requires proper EIP-712 structured-data
-    // signing with the Polymarket domain separator. If orders are rejected with a
-    // signature error, you will need to implement full EIP-712 signing per:
-    // https://github.com/Polymarket/py-order-utils
-    let signature = sign_order(wallet, token_id, &price_str, &size_str, side).await?;
-
-    let payload = CreateOrderPayload {
-        token_id: token_id.to_string(),
-        price: price_str,
-        size: size_str,
-        side: side.to_string(),
-        order_type: "GTC".to_string(),
-        signature,
-        signature_type: 0, // EOA signature
+    // Amounts use 6 decimal places (same as USDC).
+    // BUY: makerAmount = USDC to spend, takerAmount = tokens to receive.
+    // SELL: makerAmount = tokens to give, takerAmount = USDC to receive.
+    let (maker_amount, taker_amount) = if side_uint == 0 {
+        let maker = (price * size as f64 * 1_000_000.0).floor() as u128;
+        let taker = size as u128 * 1_000_000;
+        (maker, taker)
+    } else {
+        let maker = size as u128 * 1_000_000;
+        let taker = (price * size as f64 * 1_000_000.0).floor() as u128;
+        (maker, taker)
     };
+
+    // Use current timestamp as salt for uniqueness
+    let salt = now_ms() as u64;
+
+    // EIP-712 sign the order
+    let signature = eip712_order_signature(
+        &wallet.wallet,
+        wallet.address,
+        token_id,
+        maker_amount,
+        taker_amount,
+        side_uint,
+        salt,
+    )?;
+
+    // Build the order struct
+    let order = PolymarketOrderStruct {
+        salt: salt.to_string(),
+        maker: format!("{:#x}", wallet.address),
+        signer: format!("{:#x}", wallet.address),
+        taker: ZERO_ADDRESS.to_string(),
+        token_id: token_id.to_string(),
+        maker_amount: maker_amount.to_string(),
+        taker_amount: taker_amount.to_string(),
+        expiration: "0".to_string(),
+        nonce: "0".to_string(),
+        fee_rate_bps: "0".to_string(),
+        side: side_uint,
+        signature_type: 0, // EOA
+        signature,
+    };
+
+    let request_body = CreateOrderRequest {
+        order,
+        owner: wallet.creds.api_key.clone(),
+        order_type: "GTC".to_string(),
+    };
+
+    let body_str = serde_json::to_string(&request_body).context("serialise order request")?;
+
+    // L2 HMAC authentication headers
+    let timestamp = now_ms() / 1000;
+    let l2_sig = l2_signature(&wallet.creds.secret, timestamp, "POST", "/order", &body_str)
+        .context("compute L2 HMAC signature")?;
 
     let url = format!("{CLOB_API}/order");
     let resp = client
         .post(&url)
-        .json(&payload)
+        .header("Content-Type", "application/json")
+        .header("POLY_ADDRESS", format!("{:#x}", wallet.address))
+        .header("POLY_SIGNATURE", l2_sig)
+        .header("POLY_TIMESTAMP", timestamp.to_string())
+        .header("POLY_API_KEY", &wallet.creds.api_key)
+        .header("POLY_PASSPHRASE", &wallet.creds.passphrase)
+        .body(body_str)
         .send()
         .await
         .context("place order")?;
@@ -1034,27 +1284,10 @@ async fn place_market_order(
         .get("orderID")
         .or_else(|| result.get("order_id"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("No order ID in response"))?
+        .ok_or_else(|| anyhow!("No order ID in response: {}", result))?
         .to_string();
 
     Ok(order_id)
-}
-
-async fn sign_order(
-    wallet: &Arc<TradingWallet>,
-    token_id: &str,
-    price: &str,
-    size: &str,
-    side: &str,
-) -> Result<String> {
-    let message = format!("{}:{}:{}:{}", token_id, price, size, side);
-    let message_hash = keccak256(message.as_bytes());
-
-    let signature = wallet.wallet.sign_message(&message_hash)
-        .await
-        .map_err(|e| anyhow!("Signing failed: {}", e))?;
-
-    Ok(format!("0x{}", hex::encode(signature.to_vec())))
 }
 
 fn write_candle_csv(state: &MarketState, asset_id: &str, candle: &Candle) -> Result<()> {
