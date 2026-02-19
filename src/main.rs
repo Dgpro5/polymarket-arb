@@ -202,6 +202,12 @@ async fn main() -> Result<()> {
 
     let wallet = Arc::new(TradingWallet { wallet: wallet_signer, address, creds });
 
+    // Ensure the CTF Exchange has sufficient USDC allowance before trading.
+    // This is a one-time on-chain approve() call if allowance is below $1000.
+    notify_important("Checking USDC allowance for CTF Exchange...").await?;
+    ensure_allowance(&client, &wallet, CTF_EXCHANGE_ADDRESS).await
+        .context("ensure USDC allowance")?;
+
     // Initialize money manager
     let money: Arc<Mutex<MoneyManager>> = Arc::new(Mutex::new(MoneyManager {
         money_spent: 0.0,
@@ -1117,6 +1123,150 @@ async fn get_balance(client: &Client, address: &Address) -> Result<f64> {
     let raw_amount = u128::from_str_radix(hex_result, 16).unwrap_or(0);
     // USDC on Polygon has 6 decimals
     Ok(raw_amount as f64 / 1_000_000.0)
+}
+
+// ── Allowance helpers ────────────────────────────────────────────────────────
+
+// allowance(owner, spender) selector = keccak256("allowance(address,address)")[..4] = 0xdd62ed3e
+async fn get_allowance(client: &Client, owner: &Address, spender: &str) -> Result<f64> {
+    let ankr_key = env::var(ANKR_API_KEY_ENV)
+        .with_context(|| format!("Missing env var '{ANKR_API_KEY_ENV}'"))?;
+    let rpc_url = format!("https://rpc.ankr.com/polygon/{}", ankr_key.trim());
+
+    let owner_hex   = format!("{:x}", owner);
+    let spender_hex = spender.trim_start_matches("0x");
+    // ABI-encode two addresses: each padded to 32 bytes
+    let calldata = format!("0xdd62ed3e{:0>64}{:0>64}", owner_hex, spender_hex);
+
+    let body = json!({
+        "jsonrpc": "2.0",
+        "method": "eth_call",
+        "params": [{ "to": USDC_POLYGON, "data": calldata }, "latest"],
+        "id": 1
+    });
+
+    let resp = client.post(&rpc_url).json(&body).send().await
+        .context("eth_call allowance")?;
+    let raw = resp.text().await.context("read allowance response")?;
+    let parsed: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parse allowance JSON: {raw}"))?;
+
+    if let Some(err) = parsed.get("error") {
+        return Err(anyhow!("allowance eth_call error: {err}"));
+    }
+
+    let hex = parsed.get("result").and_then(|v| v.as_str()).unwrap_or("0x0")
+        .trim_start_matches("0x");
+    let raw_amount = u128::from_str_radix(hex, 16).unwrap_or(0);
+    Ok(raw_amount as f64 / 1_000_000.0)
+}
+
+// Sends an ERC-20 approve(spender, uint256::MAX) tx via eth_sendRawTransaction.
+// Uses the wallet's private key to sign the transaction on-chain.
+async fn ensure_allowance(
+    client: &Client,
+    wallet: &TradingWallet,
+    spender: &str,
+) -> Result<()> {
+    let allowance = get_allowance(client, &wallet.address, spender).await?;
+    println!("Current USDC allowance for CTF Exchange: ${:.4}", allowance);
+
+    // Only approve if allowance is under $1000 — plenty of headroom for normal trading
+    if allowance >= 1000.0 {
+        println!("Allowance sufficient, no approval needed.");
+        return Ok(());
+    }
+
+    println!("Allowance too low (${:.4}). Sending approve(MAX) transaction...", allowance);
+
+    let ankr_key = env::var(ANKR_API_KEY_ENV)
+        .with_context(|| format!("Missing env var '{ANKR_API_KEY_ENV}'"))?;
+    let rpc_url = format!("https://rpc.ankr.com/polygon/{}", ankr_key.trim());
+
+    // Get nonce
+    let nonce_body = json!({
+        "jsonrpc": "2.0", "method": "eth_getTransactionCount",
+        "params": [format!("{:#x}", wallet.address), "latest"], "id": 1
+    });
+    let nonce_resp: Value = client.post(&rpc_url).json(&nonce_body).send().await
+        .context("get nonce")?.json().await.context("parse nonce")?;
+    let nonce = nonce_resp["result"].as_str()
+        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .ok_or_else(|| anyhow!("could not parse nonce: {nonce_resp}"))?;
+
+    // Get gas price
+    let gas_body = json!({"jsonrpc":"2.0","method":"eth_gasPrice","params":[],"id":1});
+    let gas_resp: Value = client.post(&rpc_url).json(&gas_body).send().await
+        .context("get gas price")?.json().await.context("parse gas price")?;
+    let gas_price = gas_resp["result"].as_str()
+        .and_then(|s| u128::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .ok_or_else(|| anyhow!("could not parse gas price: {gas_resp}"))?;
+
+    // approve(spender, 2^256-1) calldata — selector 0x095ea7b3
+    let spender_hex = spender.trim_start_matches("0x");
+    // ABI-encode: padded spender address + uint256 max (32 bytes of 0xff)
+    let calldata_hex = format!("095ea7b3{:0>64}{}", spender_hex, "f".repeat(64));
+    let calldata_bytes = hex::decode(&calldata_hex).context("decode approve calldata")?;
+
+    // Build TypedTransaction (Legacy) so we can call tx.rlp_signed()
+    use ethers::types::transaction::eip2718::TypedTransaction;
+    let mut tx = TypedTransaction::Legacy(ethers::types::TransactionRequest {
+        from:      Some(wallet.address),
+        to:        Some(USDC_POLYGON.parse::<Address>().unwrap().into()),
+        nonce:     Some(U256::from(nonce)),
+        gas:       Some(U256::from(100_000u64)),
+        gas_price: Some(U256::from(gas_price * 2)), // 2x current for fast inclusion
+        data:      Some(calldata_bytes.into()),
+        value:     Some(U256::zero()),
+        chain_id:  Some(U64::from(CHAIN_ID)),
+        ..Default::default()
+    });
+
+    // sign_transaction fills in the chain_id and returns the Signature
+    let sig = wallet.wallet.sign_transaction(&tx)
+        .await
+        .map_err(|e| anyhow!("sign approve tx: {e}"))?;
+
+    // rlp_signed encodes the tx + signature into the raw bytes ready for broadcast
+    let raw_tx = format!("0x{}", hex::encode(tx.rlp_signed(&sig)));
+
+    let send_body = json!({
+        "jsonrpc": "2.0", "method": "eth_sendRawTransaction",
+        "params": [raw_tx], "id": 1
+    });
+    let send_resp: Value = client.post(&rpc_url).json(&send_body).send().await
+        .context("send approve tx")?.json().await.context("parse send response")?;
+
+    if let Some(err) = send_resp.get("error") {
+        return Err(anyhow!("approve tx failed: {err}"));
+    }
+
+    let tx_hash = send_resp["result"].as_str()
+        .ok_or_else(|| anyhow!("no tx hash in response: {send_resp}"))?;
+
+    println!("Approve tx sent: {tx_hash}. Waiting for confirmation...");
+
+    // Poll for receipt (up to 30 seconds)
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let receipt_body = json!({
+            "jsonrpc": "2.0", "method": "eth_getTransactionReceipt",
+            "params": [tx_hash], "id": 1
+        });
+        let receipt: Value = client.post(&rpc_url).json(&receipt_body).send().await
+            .context("get receipt")?.json().await.context("parse receipt")?;
+        if let Some(r) = receipt.get("result").filter(|v| !v.is_null()) {
+            let status = r["status"].as_str().unwrap_or("0x0");
+            if status == "0x1" {
+                println!("Approve confirmed! USDC allowance set to MAX.");
+                return Ok(());
+            } else {
+                return Err(anyhow!("Approve tx reverted. Check wallet has MATIC for gas."));
+            }
+        }
+    }
+
+    Err(anyhow!("Approve tx not confirmed within 30s. Check Polygonscan: {tx_hash}"))
 }
 
 // ── L1 EIP-712 Auth ─────────────────────────────────────────────────────────
