@@ -32,7 +32,10 @@ const DETECTION_COOLDOWN_MS: i64 = 500;
 const PRIVATE_KEY_ENV: &str = "PRIVATE_KEY";
 
 // Trading parameters
-const MIN_PROFIT_THRESHOLD: f64 = 97.5; // sum_cents must be <= this to trade
+// Profit threshold is computed dynamically from the live fee rate.
+// Formula: sum_cents < 100.0 / (1.0 + fee_bps / 10000.0)
+// This constant is a hard fallback only used if the fee fetch fails.
+const MIN_PROFIT_THRESHOLD_FALLBACK: f64 = 90.0;
 const SLIPPAGE_TOLERANCE: f64 = 0.02;   // 2% slippage tolerance
 
 static LAST_DETECTION_MS: AtomicI64 = AtomicI64::new(0);
@@ -86,6 +89,7 @@ struct MarketState {
     condition_id: String,
     asset_to_outcome: HashMap<String, String>,
     candles: HashMap<String, Candle>,
+    fee_bps: u64, // maker fee in basis points, fetched from /markets/fee-rate
 }
 
 struct MoneyManager {
@@ -239,7 +243,43 @@ async fn main() -> Result<()> {
             .zip(market.outcomes.iter().cloned())
             .collect(),
         candles: HashMap::new(),
+        fee_bps: 1000, // sensible default until first fetch
     }));
+
+    // Background task: refresh fee rate every second without blocking the main loop
+    let fee_task_state  = Arc::clone(&state);
+    let fee_task_client = client.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            ticker.tick().await;
+
+            // Grab the first asset_id from the current market
+            let asset_id = {
+                let guard = fee_task_state.lock().await;
+                guard.asset_to_outcome.keys().next().cloned()
+            };
+
+            if let Some(token_id) = asset_id {
+                match get_fee_rate(&fee_task_client, &token_id).await {
+                    Ok(new_fee) => {
+                        let mut guard = fee_task_state.lock().await;
+                        if guard.fee_bps != new_fee {
+                            let break_even = 100.0 / (1.0 + new_fee as f64 / 10000.0);
+                            println!(
+                                "Fee rate updated: {} -> {} bps. New profit threshold: {:.2}",
+                                guard.fee_bps, new_fee, break_even
+                            );
+                            guard.fee_bps = new_fee;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("WARN: fee refresh failed: {e:#}");
+                    }
+                }
+            }
+        }
+    });
 
     // Background task: write latest snapshot to disk every second
     let latest_task_state = Arc::clone(&state);
@@ -302,6 +342,7 @@ async fn main() -> Result<()> {
                         .zip(new_market.outcomes.iter().cloned())
                         .collect();
                     guard.candles.clear();
+                    guard.fee_bps = 1000; // reset to safe default until live fetch completes
                 }
 
                 // Reset window budget: fetch current balance and set limits for this window
@@ -309,8 +350,8 @@ async fn main() -> Result<()> {
                     Ok(balance) => {
                         let mut m = money.lock().await;
                         m.money_spent = 0.0;
-                        m.window_budget = balance * 0.75;   // stop after spending 3/4
-                        m.per_trade_limit = balance * 0.25; // max 1/4 per trade
+                        m.window_budget = balance * 0.75;
+                        m.per_trade_limit = balance * 0.25;
                         notify_important(&format!(
                             "Window budget set: balance=${:.4}, per_trade_limit=${:.4}, window_budget=${:.4}",
                             balance, m.per_trade_limit, m.window_budget
@@ -318,6 +359,25 @@ async fn main() -> Result<()> {
                     }
                     Err(e) => {
                         eprintln!("WARN: Could not fetch balance for budget reset: {e:#}");
+                    }
+                }
+
+                // Fetch live fee rate for this market and store it in state.
+                // Uses the first asset_id — both UP and DOWN legs share the same fee.
+                if let Some(first_asset) = new_market.asset_ids.first() {
+                    match get_fee_rate(&client, first_asset).await {
+                        Ok(fee_bps) => {
+                            let mut guard = state.lock().await;
+                            guard.fee_bps = fee_bps;
+                            let break_even = 100.0 / (1.0 + fee_bps as f64 / 10000.0);
+                            notify_important(&format!(
+                                "Fee rate: {fee_bps} bps ({:.2}%). Profit threshold: sum_cents < {break_even:.2}",
+                                fee_bps as f64 / 100.0
+                            )).await?;
+                        }
+                        Err(e) => {
+                            eprintln!("WARN: Could not fetch fee rate: {e:#}. Using fallback {MIN_PROFIT_THRESHOLD_FALLBACK}");
+                        }
                     }
                 }
 
@@ -784,7 +844,15 @@ async fn print_up_down(
         let down = (down * 100.0).round() / 100.0;
         let sum_cents = (up + down) * 100.0;
 
-        if sum_cents <= MIN_PROFIT_THRESHOLD {
+        // Dynamic threshold: profitable only when sum_cents * (1 + fee) < 100
+        let fee_bps = state.fee_bps;
+        let profit_threshold = if fee_bps > 0 {
+            100.0 / (1.0 + fee_bps as f64 / 10000.0)
+        } else {
+            MIN_PROFIT_THRESHOLD_FALLBACK
+        };
+
+        if sum_cents < profit_threshold {
             let now = now_ms();
             let last = LAST_DETECTION_MS.load(Ordering::Relaxed);
             if now - last < DETECTION_COOLDOWN_MS {
@@ -821,7 +889,7 @@ async fn print_up_down(
                 m.per_trade_limit.min(remaining)
             };
 
-            match execute_arbitrage_trade(wallet, &up_asset, &down_asset, up, down, sum_cents, trade_budget).await {
+            match execute_arbitrage_trade(wallet, &up_asset, &down_asset, up, down, sum_cents, trade_budget, fee_bps).await {
                 Ok((trade_result, trade_log)) => {
                     let mut money = money.lock().await;
                     money.money_spent += trade_result.total_spent;
@@ -867,6 +935,7 @@ async fn execute_arbitrage_trade(
     down_price: f64,
     sum_cents: f64,
     trade_budget: f64, // max USDC to spend on this single trade (1/4 of window balance)
+    fee_bps: u64,      // maker fee in basis points, fetched live per market
 ) -> Result<(TradeResult, String)> {
     let client = Client::new();
     let mut log: Vec<String> = Vec::new();
@@ -912,13 +981,13 @@ async fn execute_arbitrage_trade(
     // Step 2: Execute trades — buy both UP and DOWN legs
     log.push("Placing orders...".to_string());
 
-    let up_order_id = place_market_order(&client, wallet, up_asset_id, buy_shares, up_price, "BUY").await?;
+    let up_order_id = place_market_order(&client, wallet, up_asset_id, buy_shares, up_price, "BUY", fee_bps).await?;
     log.push(format!("UP order placed: {}", up_order_id));
 
     // FIX 7: If the DOWN order fails after UP succeeded we log the error rather than
     // silently dropping it. In a real system you would want to attempt a compensating
     // sell of the UP leg here; for now we surface the failure clearly.
-    let down_result = place_market_order(&client, wallet, down_asset_id, buy_shares, down_price, "BUY").await;
+    let down_result = place_market_order(&client, wallet, down_asset_id, buy_shares, down_price, "BUY", fee_bps).await;
     match down_result {
         Ok(down_order_id) => {
             log.push(format!("DOWN order placed: {}", down_order_id));
@@ -943,6 +1012,26 @@ async fn execute_arbitrage_trade(
         },
         log.join("\n"),
     ))
+}
+
+async fn get_fee_rate(client: &Client, token_id: &str) -> Result<u64> {
+    let url = format!("{CLOB_API}/markets/fee-rate?token_id={token_id}");
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .context("fetch fee rate")?;
+
+    let raw = resp.text().await.context("read fee rate response")?;
+    let parsed: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parse fee rate JSON: {raw}"))?;
+
+    let fee = parsed
+        .get("base_fee")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow!("missing base_fee in fee rate response: {raw}"))?;
+
+    Ok(fee)
 }
 
 async fn get_order_book(client: &Client, token_id: &str) -> Result<OrderBook> {
@@ -1239,6 +1328,7 @@ async fn place_market_order(
     size: u64,
     price: f64,
     side: &str,
+    fee_bps: u64,
 ) -> Result<String> {
     let side_uint: u8 = if side == "BUY" { 0 } else { 1 };
 
@@ -1282,7 +1372,7 @@ async fn place_market_order(
         side: side.to_string(),                        // "BUY" or "SELL" string, not 0/1
         expiration: "0".to_string(),
         nonce: "0".to_string(),
-        fee_rate_bps: "0".to_string(),
+        fee_rate_bps: fee_bps.to_string(), // live fee rate fetched from /markets/fee-rate
         signature,
         signature_type: 0,                             // 0 = EOA
     };
