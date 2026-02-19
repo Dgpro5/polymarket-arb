@@ -15,7 +15,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
-use ethers::abi::{encode as abi_encode, Token};
 use ethers::prelude::*;
 use ethers::signers::{LocalWallet, Signer};
 use ethers::utils::keccak256;
@@ -1026,50 +1025,43 @@ async fn get_balance(client: &Client, address: &Address) -> Result<f64> {
 
 // ── L1 EIP-712 Auth ─────────────────────────────────────────────────────────
 //
-// Signs the ClobAuth struct so we can call POST /auth/api-key and get
-// API credentials (apiKey, secret, passphrase).
-fn l1_auth_signature(wallet: &LocalWallet, address: Address, timestamp: i64, nonce: u64) -> Result<String> {
-    // Domain: EIP712Domain(string name,string version,uint256 chainId)
-    let domain_type_hash = keccak256(
-        b"EIP712Domain(string name,string version,uint256 chainId)"
-    );
-    let domain_separator = keccak256(&abi_encode(&[
-        Token::FixedBytes(domain_type_hash.to_vec()),
-        Token::FixedBytes(keccak256(b"ClobAuthDomain").to_vec()),
-        Token::FixedBytes(keccak256(b"1").to_vec()),
-        Token::Uint(U256::from(CHAIN_ID)),
-    ]));
+// Signs the ClobAuth struct using ethers-rs TypedData — matches the official
+// TypeScript client exactly (same domain, same field encoding).
+async fn l1_auth_signature(wallet: &LocalWallet, address: Address, timestamp: i64, nonce: u64) -> Result<String> {
+    use ethers::types::transaction::eip712::TypedData;
 
-    // Struct: ClobAuth(address address,string timestamp,uint256 nonce,string message)
-    let type_hash = keccak256(
-        b"ClobAuth(address address,string timestamp,uint256 nonce,string message)"
-    );
-    let ts_str = timestamp.to_string();
-    let attestation = "This message attests that I control the given wallet";
-    let struct_hash = keccak256(&abi_encode(&[
-        Token::FixedBytes(type_hash.to_vec()),
-        Token::Address(address),
-        Token::FixedBytes(keccak256(ts_str.as_bytes()).to_vec()),
-        Token::Uint(U256::from(nonce)),
-        Token::FixedBytes(keccak256(attestation.as_bytes()).to_vec()),
-    ]));
+    let typed_data: TypedData = serde_json::from_value(json!({
+        "primaryType": "ClobAuth",
+        "domain": {
+            "name":    "ClobAuthDomain",
+            "version": "1",
+            "chainId": CHAIN_ID
+        },
+        "types": {
+            "EIP712Domain": [
+                {"name": "name",    "type": "string"},
+                {"name": "version", "type": "string"},
+                {"name": "chainId", "type": "uint256"}
+            ],
+            "ClobAuth": [
+                {"name": "address",   "type": "address"},
+                {"name": "timestamp", "type": "string"},
+                {"name": "nonce",     "type": "uint256"},
+                {"name": "message",   "type": "string"}
+            ]
+        },
+        "message": {
+            "address":   format!("{:#x}", address),
+            "timestamp": timestamp.to_string(),
+            "nonce":     nonce,
+            "message":   "This message attests that I control the given wallet"
+        }
+    })).context("build ClobAuth TypedData")?;
 
-    // Final EIP-712 hash: "" || domainSeparator || structHash
-    let mut digest_input = Vec::with_capacity(66);
-    digest_input.extend_from_slice(b"");
-    digest_input.extend_from_slice(&domain_separator);
-    digest_input.extend_from_slice(&struct_hash);
-    let final_hash = keccak256(&digest_input);
+    let sig = wallet.sign_typed_data(&typed_data).await
+        .map_err(|e| anyhow!("sign_typed_data (L1 ClobAuth) failed: {e}"))?;
 
-    // Sign raw hash (no personal-sign prefix)
-    let sig = wallet.sign_hash(H256::from(final_hash))
-        .map_err(|e| anyhow!("L1 sign_hash failed: {e}"))?;
-
-    let mut sig_bytes = [0u8; 65];
-    sig.r.to_big_endian(&mut sig_bytes[0..32]);
-    sig.s.to_big_endian(&mut sig_bytes[32..64]);
-    sig_bytes[64] = sig.v as u8;
-    Ok(format!("0x{}", hex::encode(sig_bytes)))
+    Ok(format!("0x{}", hex::encode(sig.to_vec())))
 }
 
 // ── L2 HMAC-SHA256 Auth ───────────────────────────────────────────────────────
@@ -1093,42 +1085,89 @@ async fn get_or_create_api_creds(
 ) -> Result<ApiCredentials> {
     let timestamp = now_ms() / 1000; // seconds
     let nonce = 0u64;
-    let signature = l1_auth_signature(wallet, address, timestamp, nonce)?;
+    // l1_auth_signature is now async (uses TypedData internally)
+    let signature = l1_auth_signature(wallet, address, timestamp, nonce).await?;
+    let address_str = format!("{:#x}", address);
 
-    // Try POST first (create); if credentials already exist the API returns them anyway
-    let resp = client
-        .post(format!("{CLOB_API}/auth/api-key"))
-        .header("POLY_ADDRESS", format!("{:#x}", address))
+    // ── Step 1: try GET /derive-api-key (returns existing credentials) ──────
+    let derive_resp = client
+        .get(format!("{CLOB_API}/auth/derive-api-key"))
+        .header("POLY_ADDRESS",   &address_str)
         .header("POLY_SIGNATURE", &signature)
         .header("POLY_TIMESTAMP", timestamp.to_string())
-        .header("POLY_NONCE", nonce.to_string())
+        .header("POLY_NONCE",     nonce.to_string())
+        .send()
+        .await
+        .context("L1 auth GET /auth/derive-api-key")?;
+
+    let derive_raw = derive_resp.text().await.context("read derive response")?;
+    println!("GET /auth/derive-api-key response: {derive_raw}");
+    let derive_parsed: Value = serde_json::from_str(&derive_raw)
+        .with_context(|| format!("parse derive JSON: {derive_raw}"))?;
+
+    if let (Some(k), Some(s), Some(p)) = (
+        derive_parsed.get("apiKey").and_then(|v| v.as_str()),
+        derive_parsed.get("secret").and_then(|v| v.as_str()),
+        derive_parsed.get("passphrase").and_then(|v| v.as_str()),
+    ) {
+        println!("Derived existing API credentials.");
+        return Ok(ApiCredentials {
+            api_key:    k.to_string(),
+            secret:     s.to_string(),
+            passphrase: p.to_string(),
+        });
+    }
+
+    // ── Step 2: fall back to POST /api-key (creates new credentials) ────────
+    // NOTE: If this returns "Could not create api key", your wallet has not been
+    // registered on Polymarket yet. Visit https://polymarket.com, connect wallet
+    // 0x5f747b55957ecff985faed31635df8c6fc3677b7, and accept the Terms of Service.
+    // After that, restart the bot and credentials will be created automatically.
+    println!("No existing credentials found, attempting to create new ones via POST /auth/api-key...");
+
+    // Re-sign with a fresh timestamp for the second request
+    let timestamp2 = now_ms() / 1000;
+    let signature2 = l1_auth_signature(wallet, address, timestamp2, nonce).await?;
+
+    let create_resp = client
+        .post(format!("{CLOB_API}/auth/api-key"))
+        .header("POLY_ADDRESS",   &address_str)
+        .header("POLY_SIGNATURE", &signature2)
+        .header("POLY_TIMESTAMP", timestamp2.to_string())
+        .header("POLY_NONCE",     nonce.to_string())
         .send()
         .await
         .context("L1 auth POST /auth/api-key")?;
 
-    let raw = resp.text().await.context("read L1 auth response")?;
-    let parsed: Value = serde_json::from_str(&raw)
-        .with_context(|| format!("parse L1 auth JSON: {raw}"))?;
+    let create_raw = create_resp.text().await.context("read create response")?;
+    println!("POST /auth/api-key response: {create_raw}");
+    let create_parsed: Value = serde_json::from_str(&create_raw)
+        .with_context(|| format!("parse create JSON: {create_raw}"))?;
 
-    let api_key = parsed.get("apiKey").and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("No apiKey in L1 auth response: {raw}"))?;
-    let secret = parsed.get("secret").and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("No secret in L1 auth response: {raw}"))?;
-    let passphrase = parsed.get("passphrase").and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("No passphrase in L1 auth response: {raw}"))?;
+    let api_key = create_parsed.get("apiKey").and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!(
+            "Could not obtain API credentials.
+             Server response: {create_raw}
+             
+             If you see \"Could not create api key\", your wallet is not registered.
+             Fix: Go to https://polymarket.com, connect wallet {address_str}, accept ToS, then restart."
+        ))?;
+    let secret = create_parsed.get("secret").and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("No secret in create response: {create_raw}"))?;
+    let passphrase = create_parsed.get("passphrase").and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("No passphrase in create response: {create_raw}"))?;
 
     Ok(ApiCredentials {
-        api_key: api_key.to_string(),
-        secret: secret.to_string(),
+        api_key:    api_key.to_string(),
+        secret:     secret.to_string(),
         passphrase: passphrase.to_string(),
     })
 }
 
 // ── EIP-712 Order Signing ─────────────────────────────────────────────────────
 //
-// Signs the Polymarket CTF Exchange Order struct per EIP-712.
-// Returns hex-encoded signature string (0x-prefixed).
-fn eip712_order_signature(
+// Signs the Polymarket CTF Exchange Order struct using ethers-rs TypedData.
+async fn eip712_order_signature(
     wallet: &LocalWallet,
     address: Address,
     token_id: &str,
@@ -1137,59 +1176,58 @@ fn eip712_order_signature(
     side: u8,
     salt: u64,
 ) -> Result<String> {
-    // Domain: EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)
-    let domain_type_hash = keccak256(
-        b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
-    );
-    let exchange: Address = CTF_EXCHANGE_ADDRESS.parse().context("parse CTF exchange address")?;
-    let domain_separator = keccak256(&abi_encode(&[
-        Token::FixedBytes(domain_type_hash.to_vec()),
-        Token::FixedBytes(keccak256(b"Polymarket CTF Exchange").to_vec()),
-        Token::FixedBytes(keccak256(b"1").to_vec()),
-        Token::Uint(U256::from(CHAIN_ID)),
-        Token::Address(exchange),
-    ]));
+    use ethers::types::transaction::eip712::TypedData;
 
-    // Order struct type hash
-    let order_type_hash = keccak256(
-        b"Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)"
-    );
+    let typed_data: TypedData = serde_json::from_value(json!({
+        "primaryType": "Order",
+        "domain": {
+            "name":              "Polymarket CTF Exchange",
+            "version":           "1",
+            "chainId":           CHAIN_ID,
+            "verifyingContract": CTF_EXCHANGE_ADDRESS
+        },
+        "types": {
+            "EIP712Domain": [
+                {"name": "name",              "type": "string"},
+                {"name": "version",           "type": "string"},
+                {"name": "chainId",           "type": "uint256"},
+                {"name": "verifyingContract", "type": "address"}
+            ],
+            "Order": [
+                {"name": "salt",            "type": "uint256"},
+                {"name": "maker",           "type": "address"},
+                {"name": "signer",          "type": "address"},
+                {"name": "taker",           "type": "address"},
+                {"name": "tokenId",         "type": "uint256"},
+                {"name": "makerAmount",     "type": "uint256"},
+                {"name": "takerAmount",     "type": "uint256"},
+                {"name": "expiration",      "type": "uint256"},
+                {"name": "nonce",           "type": "uint256"},
+                {"name": "feeRateBps",      "type": "uint256"},
+                {"name": "side",            "type": "uint8"},
+                {"name": "signatureType",   "type": "uint8"}
+            ]
+        },
+        "message": {
+            "salt":          salt.to_string(),
+            "maker":         format!("{:#x}", address),
+            "signer":        format!("{:#x}", address),
+            "taker":         ZERO_ADDRESS,
+            "tokenId":       token_id,
+            "makerAmount":   maker_amount.to_string(),
+            "takerAmount":   taker_amount.to_string(),
+            "expiration":    "0",
+            "nonce":         "0",
+            "feeRateBps":    "0",
+            "side":          side,
+            "signatureType": 0u8
+        }
+    })).context("build Order TypedData")?;
 
-    let taker: Address = ZERO_ADDRESS.parse().context("parse zero address")?;
-    let token_id_uint = U256::from_dec_str(token_id)
-        .with_context(|| format!("parse tokenId '{token_id}' as U256"))?;
+    let sig = wallet.sign_typed_data(&typed_data).await
+        .map_err(|e| anyhow!("sign_typed_data (Order) failed: {e}"))?;
 
-    let struct_hash = keccak256(&abi_encode(&[
-        Token::FixedBytes(order_type_hash.to_vec()),
-        Token::Uint(U256::from(salt)),
-        Token::Address(address),                         // maker
-        Token::Address(address),                         // signer (same as maker for EOA)
-        Token::Address(taker),                           // taker = zero address
-        Token::Uint(token_id_uint),
-        Token::Uint(U256::from(maker_amount)),
-        Token::Uint(U256::from(taker_amount)),
-        Token::Uint(U256::zero()),                       // expiration = 0 (no expiry)
-        Token::Uint(U256::zero()),                       // nonce = 0
-        Token::Uint(U256::zero()),                       // feeRateBps = 0
-        Token::Uint(U256::from(side)),
-        Token::Uint(U256::zero()),                       // signatureType = 0 (EOA)
-    ]));
-
-    // Final EIP-712 digest
-    let mut digest_input = Vec::with_capacity(66);
-    digest_input.extend_from_slice(b"");
-    digest_input.extend_from_slice(&domain_separator);
-    digest_input.extend_from_slice(&struct_hash);
-    let final_hash = keccak256(&digest_input);
-
-    let sig = wallet.sign_hash(H256::from(final_hash))
-        .map_err(|e| anyhow!("order sign_hash failed: {e}"))?;
-
-    let mut sig_bytes = [0u8; 65];
-    sig.r.to_big_endian(&mut sig_bytes[0..32]);
-    sig.s.to_big_endian(&mut sig_bytes[32..64]);
-    sig_bytes[64] = sig.v as u8;
-    Ok(format!("0x{}", hex::encode(sig_bytes)))
+    Ok(format!("0x{}", hex::encode(sig.to_vec())))
 }
 
 // ── Place a market order with full L2 auth + EIP-712 signed order ─────────────
@@ -1228,7 +1266,7 @@ async fn place_market_order(
         taker_amount,
         side_uint,
         salt,
-    )?;
+    ).await?;
 
     // Build the order struct
     let order = PolymarketOrderStruct {

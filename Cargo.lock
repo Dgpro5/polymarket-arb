@@ -2422,13 +2422,16 @@ name = "polymarket-arb"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "dotenvy",
  "ethers",
  "futures-util",
  "hex",
+ "hmac",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-tungstenite 0.21.0",
 ]
