@@ -274,7 +274,13 @@ async fn main() -> Result<()> {
                         }
                     }
                     Err(e) => {
-                        eprintln!("WARN: fee refresh failed: {e:#}");
+                        // "market not found" is normal during window transitions —
+                        // the old asset_id expires while we wait for the new market.
+                        // Only log genuinely unexpected errors.
+                        let msg = e.to_string();
+                        if !msg.contains("market not found") && !msg.contains("missing base_fee") {
+                            eprintln!("WARN: fee refresh failed: {e:#}");
+                        }
                     }
                 }
             }
