@@ -1271,6 +1271,7 @@ async fn eip712_order_signature(
     taker_amount: u128,
     side: u8,
     salt: u64,
+    fee_bps: u64,
 ) -> Result<String> {
     use ethers::types::transaction::eip712::TypedData;
 
@@ -1314,7 +1315,7 @@ async fn eip712_order_signature(
             "takerAmount":   taker_amount.to_string(),
             "expiration":    "0",
             "nonce":         "0",
-            "feeRateBps":    "0",
+            "feeRateBps":    fee_bps.to_string(),
             "side":          side,
             "signatureType": 0u8
         }
@@ -1364,6 +1365,7 @@ async fn place_market_order(
         taker_amount,
         side_uint,
         salt,
+        fee_bps,
     ).await?;
 
     // Build the order struct — field types and values match the documented payload exactly
