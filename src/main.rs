@@ -777,6 +777,11 @@ async fn print_up_down(
     if let (Some(up), Some(down), Some(up_asset), Some(down_asset)) =
         (up_price, down_price, up_id, down_id)
     {
+        // Round to tick size FIRST, then check profitability.
+        // Raw prices may look profitable but round up past 100 cents.
+        // e.g. up=0.475 -> 0.48, down=0.525 -> 0.53 => sum=101 cents => loss.
+        let up   = (up   * 100.0).round() / 100.0;
+        let down = (down * 100.0).round() / 100.0;
         let sum_cents = (up + down) * 100.0;
 
         if sum_cents <= MIN_PROFIT_THRESHOLD {
@@ -1237,16 +1242,17 @@ async fn place_market_order(
 ) -> Result<String> {
     let side_uint: u8 = if side == "BUY" { 0 } else { 1 };
 
+    // Price is already rounded to tick size (0.01) by the caller.
     // Amounts use 6 decimal places (same as USDC).
     // BUY: makerAmount = USDC to spend, takerAmount = tokens to receive.
     // SELL: makerAmount = tokens to give, takerAmount = USDC to receive.
     let (maker_amount, taker_amount) = if side_uint == 0 {
-        let maker = (price * size as f64 * 1_000_000.0).floor() as u128;
+        let maker = (price * size as f64 * 1_000_000.0).round() as u128;
         let taker = size as u128 * 1_000_000;
         (maker, taker)
     } else {
         let maker = size as u128 * 1_000_000;
-        let taker = (price * size as f64 * 1_000_000.0).floor() as u128;
+        let taker = (price * size as f64 * 1_000_000.0).round() as u128;
         (maker, taker)
     };
 
