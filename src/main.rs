@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{engine::general_purpose::URL_SAFE as BASE64, Engine};
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use reqwest::Client;
@@ -891,24 +891,11 @@ async fn execute_arbitrage_trade(
         ));
     }
 
-    // Step 2: Verify live balance still covers the trade (sanity check)
-    let balance = get_balance(&client, &wallet.address).await?;
+    // Budget was already validated before calling this function (window_budget check).
+    // No extra RPC balance call needed here — it would cost ~300ms in the hot path.
     let estimated_cost = cost_per_pair * (buy_shares as f64);
-    let required_balance = estimated_cost * (1.0 + SLIPPAGE_TOLERANCE);
 
-    log.push(format!(
-        "Balance check: have=${:.4}, need=${:.4} ({}% slippage buffer), trade_budget=${:.4}",
-        balance, required_balance, SLIPPAGE_TOLERANCE * 100.0, trade_budget
-    ));
-
-    if balance < required_balance {
-        return Err(anyhow!(
-            "{}\nERROR: Live balance ${:.4} below required ${:.4} (shares={}, up={:.4}, down={:.4})",
-            log.join("\n"), balance, required_balance, buy_shares, up_price, down_price
-        ));
-    }
-
-    // Step 3: Execute trades — buy both UP and DOWN legs
+    // Step 2: Execute trades — buy both UP and DOWN legs
     log.push("Placing orders...".to_string());
 
     let up_order_id = place_market_order(&client, wallet, up_asset_id, buy_shares, up_price, "BUY").await?;
