@@ -17,6 +17,8 @@ serde_json = "1.0"
 sha2 = "0.10.9"
 tokio = { version = "1.36", features = ["macros", "rt-multi-thread", "time", "sync"] }
 tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
+polymarket-client-sdk = { version = "0.4.2", features = ["ctf"] }
+alloy = { version = "1.5.2", features = ["providers", "reqwest", "signer-local"] }
 
 
 [profile.release]

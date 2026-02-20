@@ -18,6 +18,13 @@ use tokio_tungstenite::tungstenite::Message;
 use ethers::prelude::*;
 use ethers::signers::{LocalWallet, Signer};
 use ethers::utils::keccak256;
+use alloy::providers::ProviderBuilder;
+use alloy::signers::local::LocalSigner;
+use alloy::signers::Signer as _;
+use polymarket_client_sdk::ctf::{types::RedeemPositionsRequest, Client as CtfClient};
+use polymarket_client_sdk::types::{Address as AlloyAddress, B256, U256 as AlloyU256};
+use polymarket_client_sdk::POLYGON;
+use std::str::FromStr;
 
 const GAMMA_API: &str = "https://gamma-api.polymarket.com";
 const CLOB_API: &str = "https://clob.polymarket.com";
@@ -127,6 +134,17 @@ struct OrderBook {
     asks: Vec<OrderBookLevel>,
 }
 
+#[derive(Debug, Deserialize)]
+struct BatchOrderResult {
+    success: bool,
+    #[serde(rename = "orderID", default)]
+    order_id: String,
+    #[serde(default)]
+    status: String,
+    #[serde(rename = "errorMsg", default)]
+    error_msg: String,
+}
+
 // Order inner object — field names and types match Polymarket's documented payload exactly
 #[derive(Debug, Serialize, Clone)]
 struct PolymarketOrderStruct {
@@ -166,6 +184,7 @@ struct CreateOrderRequest {
 
 // USDC contract on Polygon (6 decimals)
 const USDC_POLYGON: &str = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359";
+const USDC_E_POLYGON: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 const ANKR_API_KEY_ENV: &str = "ANKR_API_KEY";
 
 // Polymarket CTF Exchange on Polygon (non-neg-risk markets)
@@ -173,8 +192,6 @@ const CTF_EXCHANGE_ADDRESS: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
 const CHAIN_ID: u64 = 137;
 // Zero address — any counterparty can fill the order
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
-// Polymarket Conditional Tokens Framework — holds outcome shares and handles redemption
-const CTF_CONTRACT: &str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -233,7 +250,7 @@ async fn main() -> Result<()> {
                         .and_then(|v| v.as_str())
                     {
                         println!("Attempting redeem for prior window: {slug} (conditionId={cid})");
-                        match redeem_positions(&client, &wallet, cid).await {
+                        match redeem_positions(&private_key, cid).await {
                             Ok(_) => { redeemed_any = true; }
                             Err(e) => eprintln!("Redeem skipped for {slug}: {e:#}"),
                         }
@@ -477,19 +494,17 @@ async fn main() -> Result<()> {
                     send_money_snapshot(&money, close_reason).await?;
 
                     // Redeem any positions from the window that just closed.
-                    // We wait 3 seconds (already done above for timer path) for the
-                    // market to resolve before calling — for socket-close paths we
-                    // add a short wait here too.
-                    let condition_id_to_redeem = {
+                    // Save slug + conditionId before the next discover overwrites state.
+                    let (slug_to_redeem, condition_id_to_redeem) = {
                         let guard = state.lock().await;
-                        guard.condition_id.clone()
+                        (guard.market_slug.clone(), guard.condition_id.clone())
                     };
                     notify_important(&format!(
-                        "Attempting redemption for closed window (conditionId={})...",
-                        condition_id_to_redeem
+                        "Attempting redemption for closed window {} (conditionId={})...",
+                        slug_to_redeem, condition_id_to_redeem
                     )).await?;
-                    tokio::time::sleep(Duration::from_secs(5)).await; // brief wait for resolution
-                    match redeem_positions(&client, &wallet, &condition_id_to_redeem).await {
+                    tokio::time::sleep(Duration::from_secs(2)).await; // brief wait for resolution
+                    match redeem_positions(&private_key, &condition_id_to_redeem).await {
                         Ok(_) => {}
                         Err(e) => eprintln!("WARN: Redeem after window close failed: {e:#}"),
                     }
@@ -1052,29 +1067,62 @@ async fn execute_arbitrage_trade(
     // No extra RPC balance call needed here — it would cost ~300ms in the hot path.
     let estimated_cost = cost_per_pair * (buy_shares as f64);
 
-    // Step 2: Execute trades — buy both UP and DOWN legs
-    log.push("Placing orders...".to_string());
+    // Step 2: Build both order structs (signed), then submit as a single batch.
+    log.push("Building UP and DOWN orders...".to_string());
 
-    let up_order_id = place_market_order(&client, wallet, up_asset_id, buy_shares, up_price, "BUY", fee_bps).await?;
-    log.push(format!("UP order placed: {}", up_order_id));
+    let base_salt = now_ms() as u64;
+    let up_order = build_order_request(wallet, up_asset_id, buy_shares, up_price, "BUY", fee_bps, base_salt).await?;
+    let down_order = build_order_request(wallet, down_asset_id, buy_shares, down_price, "BUY", fee_bps, base_salt + 1).await?;
 
-    // FIX 7: If the DOWN order fails after UP succeeded we log the error rather than
-    // silently dropping it. In a real system you would want to attempt a compensating
-    // sell of the UP leg here; for now we surface the failure clearly.
-    let down_result = place_market_order(&client, wallet, down_asset_id, buy_shares, down_price, "BUY", fee_bps).await;
-    match down_result {
-        Ok(down_order_id) => {
-            log.push(format!("DOWN order placed: {}", down_order_id));
+    log.push("Submitting batch order (UP + DOWN) to /orders...".to_string());
+    let results = place_batch_orders(&client, wallet, vec![up_order, down_order]).await?;
+
+    if results.len() != 2 {
+        return Err(anyhow!(
+            "{}\nUnexpected batch response: expected 2 results, got {}",
+            log.join("\n"), results.len()
+        ));
+    }
+
+    let up_res = &results[0];
+    let down_res = &results[1];
+
+    if up_res.success && down_res.success {
+        log.push(format!("UP order placed: {} (status={})", up_res.order_id, up_res.status));
+        log.push(format!("DOWN order placed: {} (status={})", down_res.order_id, down_res.status));
+    } else if up_res.success && !down_res.success {
+        log.push(format!("UP order {} succeeded but DOWN FAILED: {}", up_res.order_id, down_res.error_msg));
+        log.push("Attempting to cancel UP order...".to_string());
+        match cancel_order(&client, wallet, &up_res.order_id).await {
+            Ok(_) => log.push("UP order cancelled.".to_string()),
+            Err(e) => {
+                let alert = format!(
+                    "ALERT: Only UP order went through (id={}). Could not cancel: {:#}. DOWN error: {}",
+                    up_res.order_id, e, down_res.error_msg
+                );
+                log.push(alert.clone());
+                send_discord_webhook(&alert).await?;
+            }
         }
-        Err(e) => {
-            let msg = format!(
-                "UP order {} succeeded but DOWN order FAILED: {:#}. Manual intervention required to balance position.",
-                up_order_id, e
-            );
-            log.push(msg.clone());
-            // Still propagate the error so the caller logs it to Discord
-            return Err(anyhow!("{}\n{}", log.join("\n"), e));
+        return Err(anyhow!("{}", log.join("\n")));
+    } else if !up_res.success && down_res.success {
+        log.push(format!("DOWN order {} succeeded but UP FAILED: {}", down_res.order_id, up_res.error_msg));
+        log.push("Attempting to cancel DOWN order...".to_string());
+        match cancel_order(&client, wallet, &down_res.order_id).await {
+            Ok(_) => log.push("DOWN order cancelled.".to_string()),
+            Err(e) => {
+                let alert = format!(
+                    "ALERT: Only DOWN order went through (id={}). Could not cancel: {:#}. UP error: {}",
+                    down_res.order_id, e, up_res.error_msg
+                );
+                log.push(alert.clone());
+                send_discord_webhook(&alert).await?;
+            }
         }
+        return Err(anyhow!("{}", log.join("\n")));
+    } else {
+        log.push(format!("Both orders FAILED: UP={}, DOWN={}", up_res.error_msg, down_res.error_msg));
+        return Err(anyhow!("{}", log.join("\n")));
     }
 
     let total_spent = estimated_cost;
@@ -1136,131 +1184,48 @@ fn calculate_total_size(levels: &[OrderBookLevel]) -> Result<f64> {
     Ok(total_size)
 }
 
-// ── CTF Position Redemption ───────────────────────────────────────────────────
+// ── CTF Position Redemption (via polymarket-client-sdk) ──────────────────────
 //
 // After a binary market resolves, outcome shares are redeemable for USDC via
-// the ConditionalTokens contract's redeemPositions() call.
-// We call this at startup and after every window close to sweep any settled funds.
-//
-// redeemPositions(address collateral, bytes32 parentCollectionId,
-//                 bytes32 conditionId, uint256[] indexSets)
-// selector: 0x9e9c68d0
-// indexSets [1, 2] covers both outcome slots (binary market).
+// the ConditionalTokens contract.  We use the polymarket-client-sdk CtfClient
+// which handles ABI encoding, tx signing, and confirmation internally.
+// Called at startup (sweep old windows) and after every window close.
 async fn redeem_positions(
-    client: &Client,
-    wallet: &TradingWallet,
+    private_key: &str,
     condition_id_hex: &str,
 ) -> Result<()> {
     let ankr_key = env::var(ANKR_API_KEY_ENV)
         .with_context(|| format!("Missing env var '{ANKR_API_KEY_ENV}'"))?;
     let rpc_url = format!("https://rpc.ankr.com/polygon/{}", ankr_key.trim());
 
-    // Decode condition_id: strip 0x prefix and pad/truncate to 32 bytes
-    let cid_hex = condition_id_hex.trim_start_matches("0x");
-    if cid_hex.len() != 64 {
-        return Err(anyhow!("conditionId '{condition_id_hex}' is not 32 bytes — cannot redeem"));
-    }
+    let signer = LocalSigner::from_str(private_key.trim())
+        .context("parse private key for redeem")?
+        .with_chain_id(Some(POLYGON));
 
-    // ABI-encode the call:
-    // [selector 4B][collateral 32B][parentCollectionId 32B][conditionId 32B]
-    // [offset_to_array 32B = 0x80][array_len 32B = 2][indexSet[0] 32B = 1][indexSet[1] 32B = 2]
-    let usdc_hex = USDC_POLYGON.trim_start_matches("0x");
-    let calldata_hex = format!(
-        "9e9c68d0         {:0>64}         {:0>64}         {}         {:0>64}         {:0>64}         {:0>64}         {:0>64}",
-        usdc_hex,          // collateral token (padded address)
-        "0",               // parentCollectionId = bytes32(0)
-        cid_hex,           // conditionId
-        "80",              // offset to indexSets array (128 bytes = 4 words after selector)
-        "2",               // array length
-        "1",               // indexSets[0] = 0b01 (outcome slot 0)
-        "2",               // indexSets[1] = 0b10 (outcome slot 1)
-    );
-    let calldata_bytes = hex::decode(&calldata_hex)
-        .with_context(|| format!("decode redeem calldata for conditionId={condition_id_hex}"))?;
-
-    // Get nonce
-    let nonce_body = json!({
-        "jsonrpc": "2.0", "method": "eth_getTransactionCount",
-        "params": [format!("{:#x}", wallet.address), "latest"], "id": 1
-    });
-    let nonce_resp: Value = client.post(&rpc_url).json(&nonce_body).send().await
-        .context("get nonce for redeem")?.json().await.context("parse nonce")?;
-    let nonce = nonce_resp["result"].as_str()
-        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-        .ok_or_else(|| anyhow!("could not parse nonce: {nonce_resp}"))?;
-
-    // Get gas price — use 3x for fast inclusion
-    let gas_body = json!({"jsonrpc":"2.0","method":"eth_gasPrice","params":[],"id":1});
-    let gas_resp: Value = client.post(&rpc_url).json(&gas_body).send().await
-        .context("get gas price for redeem")?.json().await.context("parse gas")?;
-    let gas_price = gas_resp["result"].as_str()
-        .and_then(|s| u128::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-        .ok_or_else(|| anyhow!("could not parse gas price: {gas_resp}"))?;
-
-    use ethers::types::transaction::eip2718::TypedTransaction;
-    let mut tx = TypedTransaction::Legacy(ethers::types::TransactionRequest {
-        from:      Some(wallet.address),
-        to:        Some(CTF_CONTRACT.parse::<Address>().unwrap().into()),
-        nonce:     Some(U256::from(nonce)),
-        gas:       Some(U256::from(300_000u64)), // redeem needs more gas than approve
-        gas_price: Some(U256::from(gas_price * 3)), // 3x = high priority
-        data:      Some(calldata_bytes.into()),
-        value:     Some(U256::zero()),
-        chain_id:  Some(U64::from(CHAIN_ID)),
-        ..Default::default()
-    });
-
-    let sig = wallet.wallet.sign_transaction(&tx)
+    let provider = ProviderBuilder::new()
+        .wallet(signer)
+        .connect(&rpc_url)
         .await
-        .map_err(|e| anyhow!("sign redeem tx: {e}"))?;
-    let raw_tx = format!("0x{}", hex::encode(tx.rlp_signed(&sig)));
+        .context("connect provider for redeem")?;
 
-    let send_body = json!({
-        "jsonrpc": "2.0", "method": "eth_sendRawTransaction",
-        "params": [raw_tx], "id": 1
-    });
-    let send_resp: Value = client.post(&rpc_url).json(&send_body).send().await
-        .context("send redeem tx")?.json().await.context("parse send response")?;
+    let ctf_client = CtfClient::new(provider, POLYGON).context("init ctf client")?;
 
-    if let Some(err) = send_resp.get("error") {
-        // "execution reverted" just means no redeemable balance — not a real error
-        let msg = err.to_string();
-        if msg.contains("revert") || msg.contains("execution") {
-            println!("No redeemable balance for conditionId={condition_id_hex} (market may not have resolved yet).");
-            return Ok(());
-        }
-        return Err(anyhow!("redeem tx failed: {err}"));
-    }
+    let collateral: AlloyAddress = USDC_E_POLYGON.parse().context("parse USDC.e")?;
+    let condition_id: B256 = condition_id_hex.parse().context("parse conditionId")?;
 
-    let tx_hash = send_resp["result"].as_str()
-        .ok_or_else(|| anyhow!("no tx hash in redeem response: {send_resp}"))?;
+    let mut req = RedeemPositionsRequest::for_binary_market(collateral, condition_id);
+    req.index_sets = vec![AlloyU256::from(1), AlloyU256::from(2)];
 
-    println!("Redeem tx sent: {tx_hash}. Waiting for confirmation...");
+    let resp = ctf_client
+        .redeem_positions(&req)
+        .await
+        .with_context(|| format!("redeem condition {condition_id:#x}"))?;
 
-    // Poll receipt (up to 30s)
-    for _ in 0..30 {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let receipt_body = json!({
-            "jsonrpc": "2.0", "method": "eth_getTransactionReceipt",
-            "params": [tx_hash], "id": 1
-        });
-        let receipt: Value = client.post(&rpc_url).json(&receipt_body).send().await
-            .context("get redeem receipt")?.json().await.context("parse receipt")?;
-        if let Some(r) = receipt.get("result").filter(|v| !v.is_null()) {
-            let status = r["status"].as_str().unwrap_or("0x0");
-            if status == "0x1" {
-                println!("Redeem confirmed for conditionId={condition_id_hex}! USDC returned to wallet.");
-                return Ok(());
-            } else {
-                // Revert likely means nothing to redeem — non-fatal
-                println!("Redeem reverted for conditionId={condition_id_hex} — probably nothing to claim yet.");
-                return Ok(());
-            }
-        }
-    }
-
-    println!("WARN: Redeem tx {tx_hash} not confirmed in 30s — check Polygonscan.");
-    Ok(()) // non-fatal: money isn't lost, tx may still confirm
+    println!(
+        "Redeemed condition {condition_id:#x}: tx={:#x} block={}",
+        resp.transaction_hash, resp.block_number
+    );
+    Ok(())
 }
 
 async fn get_balance(client: &Client, address: &Address) -> Result<f64> {
@@ -1666,16 +1631,16 @@ async fn eip712_order_signature(
     Ok(format!("0x{}", hex::encode(sig.to_vec())))
 }
 
-// ── Place a market order with full L2 auth + EIP-712 signed order ─────────────
-async fn place_market_order(
-    client: &Client,
+// ── Build a signed order request (does NOT send it) ───────────────────────────
+async fn build_order_request(
     wallet: &Arc<TradingWallet>,
     token_id: &str,
     size: u64,
     price: f64,
     side: &str,
     fee_bps: u64,
-) -> Result<String> {
+    salt: u64,
+) -> Result<CreateOrderRequest> {
     let side_uint: u8 = if side == "BUY" { 0 } else { 1 };
 
     // Price is already rounded to tick size (0.01) by the caller.
@@ -1702,9 +1667,6 @@ async fn place_market_order(
         ));
     }
 
-    // Use current timestamp as salt for uniqueness
-    let salt = now_ms() as u64;
-
     // EIP-712 sign the order
     let signature = eip712_order_signature(
         &wallet.wallet,
@@ -1717,39 +1679,44 @@ async fn place_market_order(
         fee_bps,
     ).await?;
 
-    // Build the order struct — field types and values match the documented payload exactly
     let order = PolymarketOrderStruct {
-        salt,                                          // u64 integer, not a string
+        salt,
         maker: format!("{:#x}", wallet.address),
         signer: format!("{:#x}", wallet.address),
         taker: ZERO_ADDRESS.to_string(),
         token_id: token_id.to_string(),
         maker_amount: maker_amount.to_string(),
         taker_amount: taker_amount.to_string(),
-        side: side.to_string(),                        // "BUY" or "SELL" string, not 0/1
+        side: side.to_string(),
         expiration: "0".to_string(),
         nonce: "0".to_string(),
-        fee_rate_bps: fee_bps.to_string(), // live fee rate fetched from /markets/fee-rate
+        fee_rate_bps: fee_bps.to_string(),
         signature,
-        signature_type: 0,                             // 0 = EOA
+        signature_type: 0,
     };
 
-    let request_body = CreateOrderRequest {
+    Ok(CreateOrderRequest {
         order,
         owner: wallet.creds.api_key.clone(),
         order_type: "GTC".to_string(),
         defer_exec: false,
-    };
+    })
+}
 
-    let body_str = serde_json::to_string(&request_body).context("serialise order request")?;
-    println!("POST /order body: {body_str}");
+// ── Submit multiple orders in a single batch request (POST /orders) ───────────
+async fn place_batch_orders(
+    client: &Client,
+    wallet: &Arc<TradingWallet>,
+    orders: Vec<CreateOrderRequest>,
+) -> Result<Vec<BatchOrderResult>> {
+    let body_str = serde_json::to_string(&orders).context("serialise batch orders")?;
+    println!("POST /orders body: {body_str}");
 
-    // L2 HMAC authentication headers
     let timestamp = now_ms() / 1000;
-    let l2_sig = l2_signature(&wallet.creds.secret, timestamp, "POST", "/order", &body_str)
-        .context("compute L2 HMAC signature")?;
+    let l2_sig = l2_signature(&wallet.creds.secret, timestamp, "POST", "/orders", &body_str)
+        .context("compute L2 HMAC for batch orders")?;
 
-    let url = format!("{CLOB_API}/order");
+    let url = format!("{CLOB_API}/orders");
     let resp = client
         .post(&url)
         .header("Content-Type", "application/json")
@@ -1761,22 +1728,54 @@ async fn place_market_order(
         .body(body_str)
         .send()
         .await
-        .context("place order")?;
+        .context("place batch orders")?;
 
     if !resp.status().is_success() {
         let error_text = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("Order placement failed: {}", error_text));
+        return Err(anyhow!("Batch order placement failed: {}", error_text));
     }
 
-    let result: Value = resp.json().await.context("parse order response")?;
-    let order_id = result
-        .get("orderID")
-        .or_else(|| result.get("order_id"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("No order ID in response: {}", result))?
-        .to_string();
+    let results: Vec<BatchOrderResult> = resp.json().await
+        .context("parse batch order response")?;
 
-    Ok(order_id)
+    Ok(results)
+}
+
+// ── Cancel an open order via the CLOB API ─────────────────────────────────────
+// Fallback when a batch submission partially succeeds: cancel the successful
+// leg so we don't hold an unbalanced position.  If the order already filled
+// the cancel will fail — the caller sends a Discord alert in that case.
+async fn cancel_order(
+    client: &Client,
+    wallet: &Arc<TradingWallet>,
+    order_id: &str,
+) -> Result<()> {
+    let timestamp = now_ms() / 1000;
+    let body_str = json!({"orderID": order_id}).to_string();
+    let l2_sig = l2_signature(&wallet.creds.secret, timestamp, "DELETE", "/order", &body_str)
+        .context("compute L2 HMAC for cancel")?;
+
+    let url = format!("{CLOB_API}/order");
+    let resp = client
+        .delete(&url)
+        .header("Content-Type", "application/json")
+        .header("POLY_ADDRESS", format!("{:#x}", wallet.address))
+        .header("POLY_SIGNATURE", l2_sig)
+        .header("POLY_TIMESTAMP", timestamp.to_string())
+        .header("POLY_API_KEY", &wallet.creds.api_key)
+        .header("POLY_PASSPHRASE", &wallet.creds.passphrase)
+        .body(body_str)
+        .send()
+        .await
+        .context("cancel order request")?;
+
+    if !resp.status().is_success() {
+        let error_text = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("Cancel order failed: {}", error_text));
+    }
+
+    println!("Order {} cancelled successfully.", order_id);
+    Ok(())
 }
 
 fn write_candle_csv(state: &MarketState, asset_id: &str, candle: &Candle) -> Result<()> {
