@@ -165,7 +165,7 @@ struct CreateOrderRequest {
 }
 
 // USDC contract on Polygon (6 decimals)
-const USDC_POLYGON: &str = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174";
+const USDC_POLYGON: &str = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359";
 const ANKR_API_KEY_ENV: &str = "ANKR_API_KEY";
 
 // Polymarket CTF Exchange on Polygon (non-neg-risk markets)
@@ -173,6 +173,8 @@ const CTF_EXCHANGE_ADDRESS: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
 const CHAIN_ID: u64 = 137;
 // Zero address — any counterparty can fill the order
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
+// Polymarket Conditional Tokens Framework — holds outcome shares and handles redemption
+const CTF_CONTRACT: &str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -207,6 +209,42 @@ async fn main() -> Result<()> {
     notify_important("Checking USDC allowance for CTF Exchange...").await?;
     ensure_allowance(&client, &wallet, CTF_EXCHANGE_ADDRESS).await
         .context("ensure USDC allowance")?;
+
+    // At startup, attempt to redeem positions from any previously resolved markets.
+    // This sweeps USDC back from settled CTF positions into the wallet.
+    // Uses condition_id from the most recently discovered market — older markets
+    // would need their own condition_ids, but in practice the bot only trades one
+    // market at a time and the first window it discovers is the active one.
+    notify_important("Checking for redeemable CTF positions from prior windows...").await?;
+    {
+        let startup_market = discover_active_btc_5m_market(&client).await;
+        // Try a few recent condition IDs by scanning recent slugs (last 3 windows = 15 min)
+        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        let mut redeemed_any = false;
+        for i in 1..=6 {
+            let window_start = (now_secs / 300) * 300 - i * 300;
+            let slug = format!("btc-updown-5m-{window_start}");
+            let url = format!("{GAMMA_API}/markets?slug={slug}");
+            if let Ok(resp) = client.get(&url).send().await {
+                if let Ok(data) = resp.json::<Value>().await {
+                    if let Some(cid) = data.as_array()
+                        .and_then(|a| a.first())
+                        .and_then(|m| m.get("conditionId"))
+                        .and_then(|v| v.as_str())
+                    {
+                        println!("Attempting redeem for prior window: {slug} (conditionId={cid})");
+                        match redeem_positions(&client, &wallet, cid).await {
+                            Ok(_) => { redeemed_any = true; }
+                            Err(e) => eprintln!("Redeem skipped for {slug}: {e:#}"),
+                        }
+                    }
+                }
+            }
+        }
+        if !redeemed_any {
+            println!("No prior redeemable positions found.");
+        }
+    }
 
     // Initialize money manager
     let money: Arc<Mutex<MoneyManager>> = Arc::new(Mutex::new(MoneyManager {
@@ -437,6 +475,24 @@ async fn main() -> Result<()> {
 
                 if window_closed {
                     send_money_snapshot(&money, close_reason).await?;
+
+                    // Redeem any positions from the window that just closed.
+                    // We wait 3 seconds (already done above for timer path) for the
+                    // market to resolve before calling — for socket-close paths we
+                    // add a short wait here too.
+                    let condition_id_to_redeem = {
+                        let guard = state.lock().await;
+                        guard.condition_id.clone()
+                    };
+                    notify_important(&format!(
+                        "Attempting redemption for closed window (conditionId={})...",
+                        condition_id_to_redeem
+                    )).await?;
+                    tokio::time::sleep(Duration::from_secs(5)).await; // brief wait for resolution
+                    match redeem_positions(&client, &wallet, &condition_id_to_redeem).await {
+                        Ok(_) => {}
+                        Err(e) => eprintln!("WARN: Redeem after window close failed: {e:#}"),
+                    }
                 }
             }
             Err(e) => {
@@ -979,10 +1035,16 @@ async fn execute_arbitrage_trade(
         up_total_size, down_total_size, trade_budget, cost_per_pair, buy_shares
     ));
 
-    if buy_shares == 0 {
+    const MIN_SHARES: u64 = 5; // Polymarket minimum order size
+
+    if buy_shares < MIN_SHARES {
         return Err(anyhow!(
-            "{}\nERROR: Zero shares — liquidity={:.2} or budget=${:.4} too small for cost_per_pair={:.4}",
-            log.join("\n"), liquidity_shares, trade_budget, cost_per_pair
+            "{}\nERROR: Only {} shares available (min={}). \
+             liquidity={:.2}, budget_shares={:.0}, budget=${:.4}, cost_per_pair={:.4}. \
+             Need at least ${:.2} budget for a minimum trade.",
+            log.join("\n"), buy_shares, MIN_SHARES,
+            liquidity_shares, budget_shares, trade_budget, cost_per_pair,
+            cost_per_pair * MIN_SHARES as f64
         ));
     }
 
@@ -1072,6 +1134,133 @@ fn calculate_total_size(levels: &[OrderBookLevel]) -> Result<f64> {
         .sum();
 
     Ok(total_size)
+}
+
+// ── CTF Position Redemption ───────────────────────────────────────────────────
+//
+// After a binary market resolves, outcome shares are redeemable for USDC via
+// the ConditionalTokens contract's redeemPositions() call.
+// We call this at startup and after every window close to sweep any settled funds.
+//
+// redeemPositions(address collateral, bytes32 parentCollectionId,
+//                 bytes32 conditionId, uint256[] indexSets)
+// selector: 0x9e9c68d0
+// indexSets [1, 2] covers both outcome slots (binary market).
+async fn redeem_positions(
+    client: &Client,
+    wallet: &TradingWallet,
+    condition_id_hex: &str,
+) -> Result<()> {
+    let ankr_key = env::var(ANKR_API_KEY_ENV)
+        .with_context(|| format!("Missing env var '{ANKR_API_KEY_ENV}'"))?;
+    let rpc_url = format!("https://rpc.ankr.com/polygon/{}", ankr_key.trim());
+
+    // Decode condition_id: strip 0x prefix and pad/truncate to 32 bytes
+    let cid_hex = condition_id_hex.trim_start_matches("0x");
+    if cid_hex.len() != 64 {
+        return Err(anyhow!("conditionId '{condition_id_hex}' is not 32 bytes — cannot redeem"));
+    }
+
+    // ABI-encode the call:
+    // [selector 4B][collateral 32B][parentCollectionId 32B][conditionId 32B]
+    // [offset_to_array 32B = 0x80][array_len 32B = 2][indexSet[0] 32B = 1][indexSet[1] 32B = 2]
+    let usdc_hex = USDC_POLYGON.trim_start_matches("0x");
+    let calldata_hex = format!(
+        "9e9c68d0         {:0>64}         {:0>64}         {}         {:0>64}         {:0>64}         {:0>64}         {:0>64}",
+        usdc_hex,          // collateral token (padded address)
+        "0",               // parentCollectionId = bytes32(0)
+        cid_hex,           // conditionId
+        "80",              // offset to indexSets array (128 bytes = 4 words after selector)
+        "2",               // array length
+        "1",               // indexSets[0] = 0b01 (outcome slot 0)
+        "2",               // indexSets[1] = 0b10 (outcome slot 1)
+    );
+    let calldata_bytes = hex::decode(&calldata_hex)
+        .with_context(|| format!("decode redeem calldata for conditionId={condition_id_hex}"))?;
+
+    // Get nonce
+    let nonce_body = json!({
+        "jsonrpc": "2.0", "method": "eth_getTransactionCount",
+        "params": [format!("{:#x}", wallet.address), "latest"], "id": 1
+    });
+    let nonce_resp: Value = client.post(&rpc_url).json(&nonce_body).send().await
+        .context("get nonce for redeem")?.json().await.context("parse nonce")?;
+    let nonce = nonce_resp["result"].as_str()
+        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .ok_or_else(|| anyhow!("could not parse nonce: {nonce_resp}"))?;
+
+    // Get gas price — use 3x for fast inclusion
+    let gas_body = json!({"jsonrpc":"2.0","method":"eth_gasPrice","params":[],"id":1});
+    let gas_resp: Value = client.post(&rpc_url).json(&gas_body).send().await
+        .context("get gas price for redeem")?.json().await.context("parse gas")?;
+    let gas_price = gas_resp["result"].as_str()
+        .and_then(|s| u128::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .ok_or_else(|| anyhow!("could not parse gas price: {gas_resp}"))?;
+
+    use ethers::types::transaction::eip2718::TypedTransaction;
+    let mut tx = TypedTransaction::Legacy(ethers::types::TransactionRequest {
+        from:      Some(wallet.address),
+        to:        Some(CTF_CONTRACT.parse::<Address>().unwrap().into()),
+        nonce:     Some(U256::from(nonce)),
+        gas:       Some(U256::from(300_000u64)), // redeem needs more gas than approve
+        gas_price: Some(U256::from(gas_price * 3)), // 3x = high priority
+        data:      Some(calldata_bytes.into()),
+        value:     Some(U256::zero()),
+        chain_id:  Some(U64::from(CHAIN_ID)),
+        ..Default::default()
+    });
+
+    let sig = wallet.wallet.sign_transaction(&tx)
+        .await
+        .map_err(|e| anyhow!("sign redeem tx: {e}"))?;
+    let raw_tx = format!("0x{}", hex::encode(tx.rlp_signed(&sig)));
+
+    let send_body = json!({
+        "jsonrpc": "2.0", "method": "eth_sendRawTransaction",
+        "params": [raw_tx], "id": 1
+    });
+    let send_resp: Value = client.post(&rpc_url).json(&send_body).send().await
+        .context("send redeem tx")?.json().await.context("parse send response")?;
+
+    if let Some(err) = send_resp.get("error") {
+        // "execution reverted" just means no redeemable balance — not a real error
+        let msg = err.to_string();
+        if msg.contains("revert") || msg.contains("execution") {
+            println!("No redeemable balance for conditionId={condition_id_hex} (market may not have resolved yet).");
+            return Ok(());
+        }
+        return Err(anyhow!("redeem tx failed: {err}"));
+    }
+
+    let tx_hash = send_resp["result"].as_str()
+        .ok_or_else(|| anyhow!("no tx hash in redeem response: {send_resp}"))?;
+
+    println!("Redeem tx sent: {tx_hash}. Waiting for confirmation...");
+
+    // Poll receipt (up to 30s)
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let receipt_body = json!({
+            "jsonrpc": "2.0", "method": "eth_getTransactionReceipt",
+            "params": [tx_hash], "id": 1
+        });
+        let receipt: Value = client.post(&rpc_url).json(&receipt_body).send().await
+            .context("get redeem receipt")?.json().await.context("parse receipt")?;
+        if let Some(r) = receipt.get("result").filter(|v| !v.is_null()) {
+            let status = r["status"].as_str().unwrap_or("0x0");
+            if status == "0x1" {
+                println!("Redeem confirmed for conditionId={condition_id_hex}! USDC returned to wallet.");
+                return Ok(());
+            } else {
+                // Revert likely means nothing to redeem — non-fatal
+                println!("Redeem reverted for conditionId={condition_id_hex} — probably nothing to claim yet.");
+                return Ok(());
+            }
+        }
+    }
+
+    println!("WARN: Redeem tx {tx_hash} not confirmed in 30s — check Polygonscan.");
+    Ok(()) // non-fatal: money isn't lost, tx may still confirm
 }
 
 async fn get_balance(client: &Client, address: &Address) -> Result<f64> {
@@ -1215,7 +1404,7 @@ async fn ensure_allowance(
         to:        Some(USDC_POLYGON.parse::<Address>().unwrap().into()),
         nonce:     Some(U256::from(nonce)),
         gas:       Some(U256::from(100_000u64)),
-        gas_price: Some(U256::from(gas_price * 2)), // 2x current for fast inclusion
+        gas_price: Some(U256::from(gas_price * 3)), // 3x = high priority for fast inclusion
         data:      Some(calldata_bytes.into()),
         value:     Some(U256::zero()),
         chain_id:  Some(U64::from(CHAIN_ID)),
@@ -1502,6 +1691,16 @@ async fn place_market_order(
         let taker = (price * size as f64 * 1_000_000.0).round() as u128;
         (maker, taker)
     };
+
+    // Polymarket minimum maker amount is $1 (1_000_000 in 6-decimal USDC)
+    const MIN_MAKER_AMOUNT: u128 = 1_000_000;
+    if maker_amount < MIN_MAKER_AMOUNT {
+        return Err(anyhow!(
+            "Maker amount ${:.4} is below the $1.00 minimum (size={}, price={:.4}). \
+             This leg cannot be placed — skipping trade.",
+            maker_amount as f64 / 1_000_000.0, size, price
+        ));
+    }
 
     // Use current timestamp as salt for uniqueness
     let salt = now_ms() as u64;
