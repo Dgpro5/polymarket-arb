@@ -106,6 +106,7 @@ struct MoneyManager {
     // Budget for the current 5-minute window
     window_budget: f64,      // 3/4 of balance at window start — hard stop when reached
     per_trade_limit: f64,    // 1/4 of balance at window start — max spend per trade
+    balance_at_window_start: f64, // snapshot for profit calculation at window close
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +172,19 @@ struct PolymarketOrderStruct {
     signature_type: u8, // 0 = EOA
 }
 
+// SimpleSwap exchange object returned by POST /v3/exchanges
+#[derive(Debug, Deserialize)]
+struct SimpleSwapExchange {
+    #[serde(rename = "publicId")]
+    public_id: String,
+    /// Address you must send the source currency to — do NOT hardcode this
+    #[serde(rename = "addressFrom")]
+    address_from: String,
+    #[serde(rename = "amountFrom")]
+    amount_from: String,
+    status: String,
+}
+
 // Wrapper sent to POST /order
 #[derive(Debug, Serialize)]
 struct CreateOrderRequest {
@@ -186,6 +200,12 @@ struct CreateOrderRequest {
 const USDC_POLYGON: &str = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359";
 const USDC_E_POLYGON: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 const ANKR_API_KEY_ENV: &str = "ANKR_API_KEY";
+const SIMPLESWAP_API_KEY_ENV: &str = "SIMPLESWAP_API_KEY";
+
+// Top up POL when balance falls below this — enough for ~50 Polygon txs
+const POL_LOW_THRESHOLD: f64 = 0.5;
+// Swap this many USDC.e for POL each time we top up
+const POL_TOP_UP_USDC: f64 = 10.0;
 
 // Polymarket CTF Exchange on Polygon (non-neg-risk markets)
 const CTF_EXCHANGE_ADDRESS: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
@@ -227,6 +247,11 @@ async fn main() -> Result<()> {
     ensure_allowance(&client, &wallet, CTF_EXCHANGE_ADDRESS).await
         .context("ensure USDC allowance")?;
 
+    // Top up POL (gas token) if running low — uses SimpleSwap to swap USDC.e → POL
+    notify_important("Checking POL (gas) balance...").await?;
+    check_and_top_up_pol(&client, &wallet).await
+        .unwrap_or_else(|e| eprintln!("WARN: POL top-up check failed: {e:#}"));
+
     // At startup, attempt to redeem positions from any previously resolved markets.
     // This sweeps USDC back from settled CTF positions into the wallet.
     // Uses condition_id from the most recently discovered market — older markets
@@ -234,7 +259,7 @@ async fn main() -> Result<()> {
     // market at a time and the first window it discovers is the active one.
     notify_important("Checking for redeemable CTF positions from prior windows...").await?;
     {
-        let startup_market = discover_active_btc_5m_market(&client).await;
+        let _startup_check = discover_active_btc_5m_market(&client).await;
         // Try a few recent condition IDs by scanning recent slugs (last 3 windows = 15 min)
         let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
         let mut redeemed_any = false;
@@ -270,6 +295,7 @@ async fn main() -> Result<()> {
         total_shares_bought: 0,
         window_budget: 0.0,
         per_trade_limit: 0.0,
+        balance_at_window_start: 0.0,
     }));
 
     // Check initial balance — non-fatal so a bad endpoint doesn't block startup
@@ -283,16 +309,36 @@ async fn main() -> Result<()> {
 
     let market = discover_active_btc_5m_market(&client).await?;
 
-    notify_important(&format!(
-        "Active market: https://polymarket.com/event/{}",
-        market.slug
-    ))
-    .await?;
-    notify_important(&format!(
-        "condition_id={}, asset_ids={:?}, outcomes={:?}",
-        market.condition_id, market.asset_ids, market.outcomes
-    ))
-    .await?;
+    // Send startup embed with market info and balance
+    {
+        let balance_str = match get_balance(&client, &wallet.address).await {
+            Ok(b) => format!("${:.4}", b),
+            Err(_) => "N/A".to_string(),
+        };
+        let now_utc = {
+            let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            let h = (secs % 86400) / 3600;
+            let m = (secs % 3600) / 60;
+            let s = secs % 60;
+            format!("{:02}:{:02}:{:02} UTC", h, m, s)
+        };
+        let embed = json!({
+            "title": "Bot Started",
+            "color": 0x3498DB,
+            "fields": [
+                { "name": "Market", "value": format!("[{}](https://polymarket.com/event/{})", market.slug, market.slug), "inline": false },
+                { "name": "Slug", "value": &market.slug, "inline": true },
+                { "name": "Time", "value": &now_utc, "inline": true },
+                { "name": "Balance", "value": &balance_str, "inline": true },
+                { "name": "Condition ID", "value": &market.condition_id, "inline": false }
+            ],
+            "footer": { "text": "Polymarket Arbitrage Bot" }
+        });
+        println!("Active market: https://polymarket.com/event/{}", market.slug);
+        if let Err(e) = send_discord_embed(embed).await {
+            eprintln!("Discord startup embed failed: {e:#}");
+        }
+    }
 
     let state = Arc::new(Mutex::new(MarketState {
         market_slug: market.slug.clone(),
@@ -417,6 +463,7 @@ async fn main() -> Result<()> {
                     Ok(balance) => {
                         let mut m = money.lock().await;
                         m.money_spent = 0.0;
+                        m.balance_at_window_start = balance;
                         m.window_budget = balance * 0.75;
                         m.per_trade_limit = balance * 0.25;
                         notify_important(&format!(
@@ -491,23 +538,65 @@ async fn main() -> Result<()> {
                 }
 
                 if window_closed {
-                    send_money_snapshot(&money, close_reason).await?;
-
-                    // Redeem any positions from the window that just closed.
                     // Save slug + conditionId before the next discover overwrites state.
                     let (slug_to_redeem, condition_id_to_redeem) = {
                         let guard = state.lock().await;
                         (guard.market_slug.clone(), guard.condition_id.clone())
                     };
-                    notify_important(&format!(
+                    println!(
                         "Attempting redemption for closed window {} (conditionId={})...",
                         slug_to_redeem, condition_id_to_redeem
-                    )).await?;
-                    tokio::time::sleep(Duration::from_secs(2)).await; // brief wait for resolution
-                    match redeem_positions(&private_key, &condition_id_to_redeem).await {
-                        Ok(_) => {}
-                        Err(e) => eprintln!("WARN: Redeem after window close failed: {e:#}"),
+                    );
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let redeem_ok = match redeem_positions(&private_key, &condition_id_to_redeem).await {
+                        Ok(_) => true,
+                        Err(e) => {
+                            eprintln!("WARN: Redeem after window close failed: {e:#}");
+                            false
+                        }
+                    };
+
+                    // Fetch balance after redeem for profit calculation
+                    let (balance_after, profit) = match get_balance(&client, &wallet.address).await {
+                        Ok(bal) => {
+                            let m = money.lock().await;
+                            let p = bal - m.balance_at_window_start;
+                            (format!("${:.4}", bal), p)
+                        }
+                        Err(e) => {
+                            eprintln!("WARN: Could not fetch balance after redeem: {e:#}");
+                            ("N/A".to_string(), 0.0)
+                        }
+                    };
+
+                    let m = money.lock().await;
+                    let profit_str = format!("{}{:.4}", if profit >= 0.0 { "+$" } else { "-$" }, profit.abs());
+                    let color = if profit >= 0.0 { 0x2ECC71 } else { 0xE74C3C };
+                    let embed = json!({
+                        "title": "Window Closed",
+                        "color": color,
+                        "fields": [
+                            { "name": "Slug", "value": &slug_to_redeem, "inline": false },
+                            { "name": "Close Reason", "value": close_reason, "inline": true },
+                            { "name": "Redeemed", "value": if redeem_ok { "Yes" } else { "Failed" }, "inline": true },
+                            { "name": "Profit", "value": &profit_str, "inline": true },
+                            { "name": "Balance Before", "value": format!("${:.4}", m.balance_at_window_start), "inline": true },
+                            { "name": "Balance After", "value": &balance_after, "inline": true },
+                            { "name": "Total Spent", "value": format!("${:.4}", m.money_spent), "inline": true },
+                            { "name": "Trades", "value": format!("{}", m.total_buy_positions), "inline": true },
+                            { "name": "Total Shares", "value": format!("{}", m.total_shares_bought), "inline": true }
+                        ],
+                        "footer": { "text": "Polymarket Arbitrage Bot" }
+                    });
+                    drop(m);
+                    println!("Window closed: {slug_to_redeem} | profit={profit_str} | balance={balance_after}");
+                    if let Err(e) = send_discord_embed(embed).await {
+                        eprintln!("Discord window-close embed failed: {e:#}");
                     }
+
+                    // After each redeem, refill POL if running low
+                    check_and_top_up_pol(&client, &wallet).await
+                        .unwrap_or_else(|e| eprintln!("WARN: POL top-up check failed: {e:#}"));
                 }
             }
             Err(e) => {
@@ -973,24 +1062,51 @@ async fn print_up_down(
             };
 
             match execute_arbitrage_trade(wallet, &up_asset, &down_asset, up, down, sum_cents, trade_budget, fee_bps).await {
-                Ok((trade_result, trade_log)) => {
+                Ok((trade_result, _trade_log)) => {
                     let mut money = money.lock().await;
                     money.money_spent += trade_result.total_spent;
                     money.total_buy_positions += trade_result.shares_bought as i64;
                     money.total_shares_bought += (trade_result.shares_bought * 2) as i64;
 
                     let budget_remaining = money.window_budget - money.money_spent;
-                    let trade_msg = format!(
-                        "{}\n{}\nTRADE EXECUTED: {} shares each side @ up={:.4}, down={:.4}, total_spent=${:.2}, window_remaining=${:.4}",
-                        message, trade_log, trade_result.shares_bought, up, down,
-                        trade_result.total_spent, budget_remaining
-                    );
-                    send_discord_webhook(&trade_msg).await?;
+                    let edge = 100.0 - sum_cents;
+                    let embed = json!({
+                        "title": "Trade Executed",
+                        "color": 0x2ECC71,
+                        "fields": [
+                            { "name": "UP Price", "value": format!("{:.4}", up), "inline": true },
+                            { "name": "DOWN Price", "value": format!("{:.4}", down), "inline": true },
+                            { "name": "Sum (cents)", "value": format!("{:.2}", sum_cents), "inline": true },
+                            { "name": "Edge", "value": format!("{:.2} cents", edge), "inline": true },
+                            { "name": "Shares (each side)", "value": format!("{}", trade_result.shares_bought), "inline": true },
+                            { "name": "Total Spent", "value": format!("${:.4}", trade_result.total_spent), "inline": true },
+                            { "name": "Fee Rate", "value": format!("{} bps", fee_bps), "inline": true },
+                            { "name": "Budget Remaining", "value": format!("${:.4}", budget_remaining), "inline": true },
+                            { "name": "Window Trades", "value": format!("{}", money.total_buy_positions), "inline": true }
+                        ],
+                        "footer": { "text": format!("Slug: {}", state.market_slug) }
+                    });
+                    println!("TRADE EXECUTED: {} shares @ up={:.4} down={:.4} spent=${:.4}", trade_result.shares_bought, up, down, trade_result.total_spent);
+                    if let Err(e) = send_discord_embed(embed).await {
+                        eprintln!("Discord trade embed failed: {e:#}");
+                    }
                 }
                 Err(e) => {
-                    let error_msg = format!("{}\nTRADE FAILED: {:#}", message, e);
-                    eprintln!("{}", error_msg);
-                    send_discord_webhook(&error_msg).await?;
+                    let embed = json!({
+                        "title": "Trade Failed",
+                        "color": 0xE74C3C,
+                        "description": format!("{:#}", e),
+                        "fields": [
+                            { "name": "UP Price", "value": format!("{:.4}", up), "inline": true },
+                            { "name": "DOWN Price", "value": format!("{:.4}", down), "inline": true },
+                            { "name": "Sum (cents)", "value": format!("{:.2}", sum_cents), "inline": true }
+                        ],
+                        "footer": { "text": format!("Slug: {}", state.market_slug) }
+                    });
+                    eprintln!("TRADE FAILED: {:#}", e);
+                    if let Err(e) = send_discord_embed(embed).await {
+                        eprintln!("Discord trade-fail embed failed: {e:#}");
+                    }
                 }
             }
         } else {
@@ -1819,6 +1935,241 @@ fn parse_price(raw: &str) -> Option<f64> {
     raw.parse::<f64>().ok()
 }
 
+// ── POL auto-top-up via SimpleSwap ───────────────────────────────────────────
+
+/// Reads the native POL (gas token) balance via eth_getBalance.
+async fn get_pol_balance(client: &Client, address: &Address) -> Result<f64> {
+    let ankr_key = env::var(ANKR_API_KEY_ENV)
+        .with_context(|| format!("Missing env var '{ANKR_API_KEY_ENV}'"))?;
+    let rpc_url = format!("https://rpc.ankr.com/polygon/{}", ankr_key.trim());
+
+    let body = json!({
+        "jsonrpc": "2.0",
+        "method": "eth_getBalance",
+        "params": [format!("{:#x}", address), "latest"],
+        "id": 1
+    });
+    let resp: Value = client.post(&rpc_url).json(&body).send().await
+        .context("eth_getBalance")?.json().await.context("parse eth_getBalance")?;
+
+    if let Some(err) = resp.get("error") {
+        return Err(anyhow!("eth_getBalance error: {err}"));
+    }
+    let hex = resp["result"].as_str().unwrap_or("0x0").trim_start_matches("0x");
+    let raw = u128::from_str_radix(hex, 16).unwrap_or(0);
+    Ok(raw as f64 / 1e18) // POL has 18 decimals
+}
+
+/// POST /v3/exchanges — creates a floating-rate swap on SimpleSwap.
+/// Swaps USDC.e (Polygon) for POL and sends it to `recipient`.
+/// Returns the exchange object which contains the deposit address.
+async fn create_simpleswap_exchange(
+    client: &Client,
+    amount_usdc: f64,
+    recipient: &str,
+) -> Result<SimpleSwapExchange> {
+    let api_key = env::var(SIMPLESWAP_API_KEY_ENV)
+        .with_context(|| format!("Missing '{SIMPLESWAP_API_KEY_ENV}' in .env"))?;
+
+    let payload = json!({
+        "tickerFrom":           "usdcpoly",   // USDC.e on Polygon
+        "networkFrom":          "polygon",
+        "tickerTo":             "pol",         // Polygon gas token (POL/MATIC)
+        "networkTo":            "polygon",
+        "amount":               format!("{:.6}", amount_usdc),
+        "fixed":                false,
+        "reverse":              false,
+        "customFee":            null,
+        "addressTo":            recipient,     // send POL here
+        "extraIdTo":            "",
+        "userRefundAddress":    recipient,     // refund USDC.e here if swap fails
+        "userRefundExtraId":    "",
+        "rateId":               ""
+    });
+
+    let resp = client
+        .post("https://api.simpleswap.io/v3/exchanges")
+        .header("x-api-key", api_key.trim())
+        .header("Accept", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .context("SimpleSwap POST /v3/exchanges")?;
+
+    let data: Value = resp.json().await.context("parse SimpleSwap response")?;
+
+    // v3 wraps the payload in a "result" key
+    let obj = data.get("result").unwrap_or(&data);
+
+    if let Some(err) = data.get("error").or_else(|| data.get("message")) {
+        return Err(anyhow!("SimpleSwap API error: {err}"));
+    }
+
+    Ok(SimpleSwapExchange {
+        public_id:    obj["publicId"].as_str().unwrap_or("").to_string(),
+        address_from: obj["addressFrom"].as_str().unwrap_or("").to_string(),
+        amount_from:  obj["amountFrom"].as_str().unwrap_or("").to_string(),
+        status:       obj["status"].as_str().unwrap_or("").to_string(),
+    })
+}
+
+/// Sends `amount_usdc` USDC.e (6-decimal ERC-20) to `to_address` on Polygon.
+/// selector: transfer(address,uint256) = 0xa9059cbb
+async fn send_usdc_transfer(
+    client: &Client,
+    wallet: &TradingWallet,
+    to_address: &str,
+    amount_usdc: f64,
+) -> Result<String> {
+    let ankr_key = env::var(ANKR_API_KEY_ENV)
+        .with_context(|| format!("Missing env var '{ANKR_API_KEY_ENV}'"))?;
+    let rpc_url = format!("https://rpc.ankr.com/polygon/{}", ankr_key.trim());
+
+    // Nonce
+    let nonce_body = json!({
+        "jsonrpc": "2.0", "method": "eth_getTransactionCount",
+        "params": [format!("{:#x}", wallet.address), "latest"], "id": 1
+    });
+    let nonce_resp: Value = client.post(&rpc_url).json(&nonce_body).send().await
+        .context("get nonce for USDC transfer")?.json().await?;
+    let nonce = nonce_resp["result"].as_str()
+        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .ok_or_else(|| anyhow!("bad nonce: {nonce_resp}"))?;
+
+    // Gas price
+    let gas_body = json!({"jsonrpc":"2.0","method":"eth_gasPrice","params":[],"id":1});
+    let gas_resp: Value = client.post(&rpc_url).json(&gas_body).send().await
+        .context("get gas price")?.json().await?;
+    let gas_price = gas_resp["result"].as_str()
+        .and_then(|s| u128::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .ok_or_else(|| anyhow!("bad gas price: {gas_resp}"))?;
+
+    // transfer(address,uint256) calldata
+    let amount_raw = (amount_usdc * 1_000_000.0) as u64; // 6 decimals
+    let to_hex = to_address.trim_start_matches("0x");
+    let calldata_hex = format!("a9059cbb{:0>64}{:0>64x}", to_hex, amount_raw);
+    let calldata_bytes = hex::decode(&calldata_hex).context("decode USDC transfer calldata")?;
+
+    use ethers::types::transaction::eip2718::TypedTransaction;
+    let mut tx = TypedTransaction::Legacy(ethers::types::TransactionRequest {
+        from:      Some(wallet.address),
+        to:        Some(USDC_E_POLYGON.parse::<Address>().unwrap().into()),
+        nonce:     Some(U256::from(nonce)),
+        gas:       Some(U256::from(80_000u64)),
+        gas_price: Some(U256::from(gas_price * 3)), // 3× for fast inclusion
+        data:      Some(calldata_bytes.into()),
+        value:     Some(U256::zero()),
+        chain_id:  Some(U64::from(CHAIN_ID)),
+        ..Default::default()
+    });
+
+    let sig = wallet.wallet.sign_transaction(&tx).await
+        .map_err(|e| anyhow!("sign USDC transfer: {e}"))?;
+    let raw_tx = format!("0x{}", hex::encode(tx.rlp_signed(&sig)));
+
+    let send_body = json!({
+        "jsonrpc": "2.0", "method": "eth_sendRawTransaction",
+        "params": [raw_tx], "id": 1
+    });
+    let send_resp: Value = client.post(&rpc_url).json(&send_body).send().await
+        .context("broadcast USDC transfer")?.json().await?;
+
+    if let Some(err) = send_resp.get("error") {
+        return Err(anyhow!("USDC transfer tx failed: {err}"));
+    }
+    let tx_hash = send_resp["result"].as_str()
+        .ok_or_else(|| anyhow!("no tx hash in response: {send_resp}"))?
+        .to_string();
+
+    Ok(tx_hash)
+}
+
+/// Checks the POL (gas token) balance and, if below POL_LOW_THRESHOLD,
+/// creates a SimpleSwap exchange and sends USDC.e to the deposit address.
+/// SimpleSwap will then forward POL to our wallet asynchronously.
+async fn check_and_top_up_pol(client: &Client, wallet: &Arc<TradingWallet>) -> Result<()> {
+    // Skip silently if no API key configured
+    if env::var(SIMPLESWAP_API_KEY_ENV).map(|k| k.trim().is_empty()).unwrap_or(true) {
+        return Ok(());
+    }
+
+    let pol = match get_pol_balance(client, &wallet.address).await {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("WARN: Could not check POL balance: {e:#}");
+            return Ok(());
+        }
+    };
+
+    println!("POL balance: {:.6} POL", pol);
+
+    if pol >= POL_LOW_THRESHOLD {
+        println!("POL balance sufficient ({:.6} >= {} threshold).", pol, POL_LOW_THRESHOLD);
+        return Ok(());
+    }
+
+    println!("POL low ({:.6} POL). Initiating SimpleSwap top-up ({} USDC → POL)...", pol, POL_TOP_UP_USDC);
+
+    let recipient = format!("{:#x}", wallet.address);
+
+    let exchange = match create_simpleswap_exchange(client, POL_TOP_UP_USDC, &recipient).await {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("WARN: SimpleSwap exchange creation failed: {e:#}");
+            return Ok(());
+        }
+    };
+
+    if exchange.address_from.is_empty() {
+        eprintln!("WARN: SimpleSwap returned empty deposit address. Skipping top-up.");
+        return Ok(());
+    }
+
+    println!(
+        "SimpleSwap exchange created: id={} deposit={} amount_from={}",
+        exchange.public_id, exchange.address_from, exchange.amount_from
+    );
+
+    match send_usdc_transfer(client, wallet, &exchange.address_from, POL_TOP_UP_USDC).await {
+        Ok(tx_hash) => {
+            let embed = json!({
+                "title": "POL Top-Up Initiated",
+                "color": 0xF39C12,
+                "fields": [
+                    { "name": "Trigger", "value": format!("{:.6} POL (threshold: {} POL)", pol, POL_LOW_THRESHOLD), "inline": false },
+                    { "name": "USDC Sent", "value": format!("${:.2}", POL_TOP_UP_USDC), "inline": true },
+                    { "name": "Deposit Address", "value": &exchange.address_from, "inline": false },
+                    { "name": "Exchange ID", "value": &exchange.public_id, "inline": true },
+                    { "name": "Tx Hash", "value": &tx_hash, "inline": false }
+                ],
+                "footer": { "text": "SimpleSwap will deliver POL to your wallet shortly" }
+            });
+            println!("USDC sent to SimpleSwap deposit address: tx={}", tx_hash);
+            if let Err(e) = send_discord_embed(embed).await {
+                eprintln!("Discord POL top-up embed failed: {e:#}");
+            }
+        }
+        Err(e) => {
+            eprintln!("WARN: Failed to send USDC to SimpleSwap deposit address: {e:#}");
+            let embed = json!({
+                "title": "POL Top-Up Failed",
+                "color": 0xE74C3C,
+                "description": format!("{:#}", e),
+                "fields": [
+                    { "name": "POL Balance", "value": format!("{:.6} POL", pol), "inline": true },
+                    { "name": "Exchange ID", "value": &exchange.public_id, "inline": true }
+                ],
+                "footer": { "text": "Send USDC.e manually to the deposit address above to proceed" }
+            });
+            if let Err(e2) = send_discord_embed(embed).await {
+                eprintln!("Discord POL top-up fail embed failed: {e2:#}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 async fn send_discord_webhook(message: &str) -> Result<()> {
     if DISCORD_WEBHOOK_URL.trim().is_empty() {
         return Ok(());
@@ -1835,6 +2186,22 @@ async fn send_discord_webhook(message: &str) -> Result<()> {
     Ok(())
 }
 
+async fn send_discord_embed(embed: Value) -> Result<()> {
+    if DISCORD_WEBHOOK_URL.trim().is_empty() {
+        return Ok(());
+    }
+
+    let client = Client::new();
+    let payload = json!({ "embeds": [embed] });
+    client
+        .post(DISCORD_WEBHOOK_URL)
+        .json(&payload)
+        .send()
+        .await
+        .context("send discord embed")?;
+    Ok(())
+}
+
 async fn notify_important(message: &str) -> Result<()> {
     println!("{message}");
     if let Err(e) = send_discord_webhook(message).await {
@@ -1843,31 +2210,7 @@ async fn notify_important(message: &str) -> Result<()> {
     Ok(())
 }
 
-async fn send_money_snapshot(money: &Arc<Mutex<MoneyManager>>, reason: &str) -> Result<()> {
-    let snapshot = {
-        let money = money.lock().await;
-        let gross_payout = money.total_shares_bought as f64 * 1.0;
-        let net_pnl = gross_payout - money.money_spent;
-        let budget_used_pct = if money.window_budget > 0.0 {
-            (money.money_spent / money.window_budget) * 100.0
-        } else {
-            0.0
-        };
-        format!(
-            "Window closed ({reason}).\n             money_spent=${:.4} ({:.1}% of ${:.4} window budget)\n             per_trade_limit=${:.4} | trades={} | total_shares={}\n             estimated_gross_payout=${:.4} | estimated_net_pnl=${:.4}\n             (assumes all positions resolve at $1.00)",
-            money.money_spent,
-            budget_used_pct,
-            money.window_budget,
-            money.per_trade_limit,
-            money.total_buy_positions,
-            money.total_shares_bought,
-            gross_payout,
-            net_pnl,
-        )
-    };
-    send_discord_webhook(&snapshot).await?;
-    Ok(())
-}
+
 
 fn parse_timestamp(value: Option<&Value>) -> Option<i64> {
     let v = value?;
