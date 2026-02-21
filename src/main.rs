@@ -196,8 +196,7 @@ struct CreateOrderRequest {
     defer_exec: bool,     // false = execute immediately
 }
 
-// USDC contract on Polygon (6 decimals)
-const USDC_POLYGON: &str = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359";
+// USDC.e (bridged USDC) on Polygon — used by Polymarket's CTF as collateral
 const USDC_E_POLYGON: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 const ANKR_API_KEY_ENV: &str = "ANKR_API_KEY";
 const SIMPLESWAP_API_KEY_ENV: &str = "SIMPLESWAP_API_KEY";
@@ -1362,7 +1361,7 @@ async fn get_balance(client: &Client, address: &Address) -> Result<f64> {
         "jsonrpc": "2.0",
         "method": "eth_call",
         "params": [
-            { "to": USDC_POLYGON, "data": calldata },
+            { "to": USDC_E_POLYGON, "data": calldata },
             "latest"
         ],
         "id": 1
@@ -1411,7 +1410,7 @@ async fn get_allowance(client: &Client, owner: &Address, spender: &str) -> Resul
     let body = json!({
         "jsonrpc": "2.0",
         "method": "eth_call",
-        "params": [{ "to": USDC_POLYGON, "data": calldata }, "latest"],
+        "params": [{ "to": USDC_E_POLYGON, "data": calldata }, "latest"],
         "id": 1
     });
 
@@ -1482,7 +1481,7 @@ async fn ensure_allowance(
     use ethers::types::transaction::eip2718::TypedTransaction;
     let mut tx = TypedTransaction::Legacy(ethers::types::TransactionRequest {
         from:      Some(wallet.address),
-        to:        Some(USDC_POLYGON.parse::<Address>().unwrap().into()),
+        to:        Some(USDC_E_POLYGON.parse::<Address>().unwrap().into()),
         nonce:     Some(U256::from(nonce)),
         gas:       Some(U256::from(100_000u64)),
         gas_price: Some(U256::from(gas_price * 3)), // 3x = high priority for fast inclusion
