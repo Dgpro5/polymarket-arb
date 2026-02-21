@@ -1228,27 +1228,71 @@ async fn execute_arbitrage_trade(
         }
 
         // ── UP succeeded, DOWN failed ────────────────────────────────────
+        // Fast path: retry just the failed DOWN leg before resorting to
+        // cancelling the successful UP order. This saves ~200ms (no cancel
+        // roundtrip) and keeps the already-matched UP leg intact.
         if up_res.success && !down_res.success {
             log.push(format!(
-                "UP order {} succeeded but DOWN FAILED: {}",
+                "UP order {} succeeded but DOWN FAILED: {}. Retrying DOWN leg...",
                 up_res.order_id, down_res.error_msg
             ));
-            log.push("Attempting to cancel UP order...".to_string());
-            match cancel_order(&client, wallet, &up_res.order_id).await {
-                Ok(_) => {
-                    log.push("UP order cancelled successfully.".to_string());
-                    last_error = format!("DOWN failed: {}", down_res.error_msg);
-                    let retry_note = if attempt < MAX_ORDER_RETRIES { "Retrying..." } else { "No more retries." };
-                    let _ = send_discord_webhook(&format!(
-                        "⚠ Partial failure (attempt {}/{}): DOWN order failed ({}). UP order cancelled. {}",
-                        attempt, MAX_ORDER_RETRIES, down_res.error_msg, retry_note
-                    )).await;
-                    if attempt < MAX_ORDER_RETRIES {
-                        continue;
+
+            let retry_salt = now_ms() as u64 + 100;
+            let down_retry = build_order_request(
+                wallet, down_asset_id, buy_shares, down_price, "BUY", fee_bps, retry_salt,
+            ).await;
+
+            let retry_ok = match down_retry {
+                Ok(order) => {
+                    match place_batch_orders(&client, wallet, vec![order]).await {
+                        Ok(res) if res.len() == 1 && res[0].success => {
+                            log.push(format!(
+                                "DOWN retry succeeded: {} (status={})",
+                                res[0].order_id, res[0].status
+                            ));
+                            true
+                        }
+                        Ok(res) => {
+                            let msg = res.first().map(|r| r.error_msg.as_str()).unwrap_or("empty response");
+                            log.push(format!("DOWN retry also failed: {}", msg));
+                            false
+                        }
+                        Err(e) => {
+                            log.push(format!("DOWN retry request error: {:#}", e));
+                            false
+                        }
                     }
                 }
                 Err(e) => {
-                    // Cancel failed — we have an unbalanced position. Do NOT retry.
+                    log.push(format!("DOWN retry build error: {:#}", e));
+                    false
+                }
+            };
+
+            if retry_ok {
+                // Both legs are now placed — success
+                log.push(format!("UP order placed: {} (status={})", up_res.order_id, up_res.status));
+                let total_spent = estimated_cost;
+                return Ok((
+                    TradeResult { shares_bought: buy_shares, total_spent },
+                    log.join("\n"),
+                ));
+            }
+
+            // DOWN retry failed too — cancel the UP leg and fall through to full retry
+            log.push("DOWN retry failed. Cancelling UP order...".to_string());
+            match cancel_order(&client, wallet, &up_res.order_id).await {
+                Ok(_) => {
+                    log.push("UP order cancelled.".to_string());
+                    last_error = format!("DOWN failed: {}", down_res.error_msg);
+                    let _ = send_discord_webhook(&format!(
+                        "⚠ Partial failure (attempt {}/{}): DOWN order failed twice ({}). UP cancelled. {}",
+                        attempt, MAX_ORDER_RETRIES, down_res.error_msg,
+                        if attempt < MAX_ORDER_RETRIES { "Retrying both..." } else { "No more retries." }
+                    )).await;
+                    if attempt < MAX_ORDER_RETRIES { continue; }
+                }
+                Err(e) => {
                     let alert = format!(
                         "🚨 ALERT: Only UP order went through (id={}). Could not cancel: {:#}. DOWN error: {}",
                         up_res.order_id, e, down_res.error_msg
@@ -1260,27 +1304,69 @@ async fn execute_arbitrage_trade(
             }
         }
         // ── DOWN succeeded, UP failed ────────────────────────────────────
+        // Same fast-path: retry just the failed UP leg first.
         else if !up_res.success && down_res.success {
             log.push(format!(
-                "DOWN order {} succeeded but UP FAILED: {}",
+                "DOWN order {} succeeded but UP FAILED: {}. Retrying UP leg...",
                 down_res.order_id, up_res.error_msg
             ));
-            log.push("Attempting to cancel DOWN order...".to_string());
-            match cancel_order(&client, wallet, &down_res.order_id).await {
-                Ok(_) => {
-                    log.push("DOWN order cancelled successfully.".to_string());
-                    last_error = format!("UP failed: {}", up_res.error_msg);
-                    let retry_note = if attempt < MAX_ORDER_RETRIES { "Retrying..." } else { "No more retries." };
-                    let _ = send_discord_webhook(&format!(
-                        "⚠ Partial failure (attempt {}/{}): UP order failed ({}). DOWN order cancelled. {}",
-                        attempt, MAX_ORDER_RETRIES, up_res.error_msg, retry_note
-                    )).await;
-                    if attempt < MAX_ORDER_RETRIES {
-                        continue;
+
+            let retry_salt = now_ms() as u64 + 200;
+            let up_retry = build_order_request(
+                wallet, up_asset_id, buy_shares, up_price, "BUY", fee_bps, retry_salt,
+            ).await;
+
+            let retry_ok = match up_retry {
+                Ok(order) => {
+                    match place_batch_orders(&client, wallet, vec![order]).await {
+                        Ok(res) if res.len() == 1 && res[0].success => {
+                            log.push(format!(
+                                "UP retry succeeded: {} (status={})",
+                                res[0].order_id, res[0].status
+                            ));
+                            true
+                        }
+                        Ok(res) => {
+                            let msg = res.first().map(|r| r.error_msg.as_str()).unwrap_or("empty response");
+                            log.push(format!("UP retry also failed: {}", msg));
+                            false
+                        }
+                        Err(e) => {
+                            log.push(format!("UP retry request error: {:#}", e));
+                            false
+                        }
                     }
                 }
                 Err(e) => {
-                    // Cancel failed — unbalanced position. Do NOT retry.
+                    log.push(format!("UP retry build error: {:#}", e));
+                    false
+                }
+            };
+
+            if retry_ok {
+                // Both legs are now placed — success
+                log.push(format!("DOWN order placed: {} (status={})", down_res.order_id, down_res.status));
+                let total_spent = estimated_cost;
+                return Ok((
+                    TradeResult { shares_bought: buy_shares, total_spent },
+                    log.join("\n"),
+                ));
+            }
+
+            // UP retry failed too — cancel the DOWN leg and fall through to full retry
+            log.push("UP retry failed. Cancelling DOWN order...".to_string());
+            match cancel_order(&client, wallet, &down_res.order_id).await {
+                Ok(_) => {
+                    log.push("DOWN order cancelled.".to_string());
+                    last_error = format!("UP failed: {}", up_res.error_msg);
+                    let _ = send_discord_webhook(&format!(
+                        "⚠ Partial failure (attempt {}/{}): UP order failed twice ({}). DOWN cancelled. {}",
+                        attempt, MAX_ORDER_RETRIES, up_res.error_msg,
+                        if attempt < MAX_ORDER_RETRIES { "Retrying both..." } else { "No more retries." }
+                    )).await;
+                    if attempt < MAX_ORDER_RETRIES { continue; }
+                }
+                Err(e) => {
                     let alert = format!(
                         "🚨 ALERT: Only DOWN order went through (id={}). Could not cancel: {:#}. UP error: {}",
                         down_res.order_id, e, up_res.error_msg
