@@ -363,6 +363,47 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Background task: refresh balance every 5 minutes and recalculate budget.
+    // When money returns to the wallet (cancelled orders, redeemed positions),
+    // the MoneyManager's tracked budget goes stale. This periodic refresh
+    // recalculates from the actual on-chain balance so we don't stop trading
+    // while sitting on available funds.
+    let balance_task_money   = Arc::clone(&money);
+    let balance_task_wallet  = Arc::clone(&wallet);
+    let balance_task_client  = client.clone();
+    tokio::spawn(async move {
+        // 5 minutes — matches the window duration
+        let mut ticker = tokio::time::interval(Duration::from_secs(5 * 60));
+        ticker.tick().await; // first tick fires immediately, skip it
+        loop {
+            ticker.tick().await;
+            match get_balance(&balance_task_client, &balance_task_wallet.address).await {
+                Ok(balance) => {
+                    let mut m = balance_task_money.lock().await;
+                    let old_budget = m.window_budget;
+                    let old_spent  = m.money_spent;
+                    // Recalculate budget from actual balance
+                    m.balance_at_window_start = balance;
+                    m.window_budget = balance * 0.75;
+                    m.per_trade_limit = balance * 0.25;
+                    m.money_spent = 0.0; // reset — budget is now based on fresh balance
+                    println!(
+                        "Balance refresh: ${:.4} (was budget=${:.4}, spent=${:.4}). New budget=${:.4}, per_trade=${:.4}",
+                        balance, old_budget, old_spent, m.window_budget, m.per_trade_limit
+                    );
+
+                    // Also verify USDC allowance is still sufficient
+                    if let Err(e) = ensure_allowance(&balance_task_client, &*balance_task_wallet, CTF_EXCHANGE_ADDRESS).await {
+                        eprintln!("WARN: periodic allowance check failed: {e:#}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("WARN: periodic balance refresh failed: {e:#}");
+                }
+            }
+        }
+    });
+
     // Background task: write latest snapshot to disk every second
     let latest_task_state = Arc::clone(&state);
     tokio::spawn(async move {
@@ -1154,8 +1195,15 @@ async fn execute_arbitrage_trade(
     // No extra RPC balance call needed here — it would cost ~300ms in the hot path.
     let estimated_cost = cost_per_pair * (buy_shares as f64);
 
-    // Step 2: Build both order structs (signed), then submit as a single batch.
-    // Retry up to MAX_ORDER_RETRIES times on partial or full failure.
+    // Step 2: Place orders SEQUENTIALLY — UP first, then DOWN.
+    //
+    // Polymarket confirmed: batch orders (POST /orders with 2 items) fail because
+    // the first order reserves your available balance, causing the second to be
+    // rejected with "insufficient balance" even though you have enough for both.
+    // There is no atomic "both or nothing" mode.
+    //
+    // Sequential placement avoids this entirely: each order sees the full
+    // available balance at submission time.
     const MAX_ORDER_RETRIES: u32 = 3;
     const RETRY_DELAY_MS: u64 = 200;
 
@@ -1170,224 +1218,141 @@ async fn execute_arbitrage_trade(
             tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
         }
 
-        // Build fresh orders with new salts each attempt
-        log.push(format!("Building UP and DOWN orders (attempt {}/{})...", attempt, MAX_ORDER_RETRIES));
-        let base_salt = now_ms() as u64;
-        let up_order = build_order_request(wallet, up_asset_id, buy_shares, up_price, "BUY", fee_bps, base_salt).await?;
-        let down_order = build_order_request(wallet, down_asset_id, buy_shares, down_price, "BUY", fee_bps, base_salt + 1).await?;
+        // ── Place UP order first ─────────────────────────────────────────
+        log.push(format!("Building UP order (attempt {}/{})...", attempt, MAX_ORDER_RETRIES));
+        let up_salt = now_ms() as u64;
+        let up_order = build_order_request(wallet, up_asset_id, buy_shares, up_price, "BUY", fee_bps, up_salt).await?;
 
-        log.push(format!("Submitting batch order (UP + DOWN) to /orders (attempt {}/{})...", attempt, MAX_ORDER_RETRIES));
-
-        // Handle network/request errors — retry
-        let results = match place_batch_orders(&client, wallet, vec![up_order, down_order]).await {
-            Ok(r) => r,
+        log.push("Submitting UP order...".to_string());
+        let up_res = match place_batch_orders(&client, wallet, vec![up_order]).await {
+            Ok(r) if r.len() == 1 => r.into_iter().next().unwrap(),
+            Ok(r) => {
+                last_error = format!("UP order: unexpected response length {}", r.len());
+                log.push(last_error.clone());
+                if attempt < MAX_ORDER_RETRIES { continue; }
+                return Err(anyhow!("{}\n{}", log.join("\n"), last_error));
+            }
             Err(e) => {
-                last_error = format!("Batch request failed: {:#}", e);
+                last_error = format!("UP order request failed: {:#}", e);
                 log.push(last_error.clone());
                 if attempt < MAX_ORDER_RETRIES {
                     let _ = send_discord_webhook(&format!(
-                        "⚠ Order batch request failed (attempt {}/{}): {:#}. Retrying...",
+                        "⚠ UP order request failed (attempt {}/{}): {:#}. Retrying...",
                         attempt, MAX_ORDER_RETRIES, e
                     )).await;
                     continue;
                 }
-                return Err(anyhow!(
-                    "{}\nAll {} attempts failed. Last error: {}",
-                    log.join("\n"), MAX_ORDER_RETRIES, last_error
-                ));
+                return Err(anyhow!("{}\nAll {} attempts failed. Last error: {}", log.join("\n"), MAX_ORDER_RETRIES, last_error));
             }
         };
 
-        if results.len() != 2 {
-            last_error = format!("Unexpected batch response: expected 2 results, got {}", results.len());
+        if !up_res.success {
+            last_error = format!("UP order rejected: {}", up_res.error_msg);
             log.push(last_error.clone());
             if attempt < MAX_ORDER_RETRIES {
+                let _ = send_discord_webhook(&format!(
+                    "⚠ UP order rejected (attempt {}/{}): {}. Retrying...",
+                    attempt, MAX_ORDER_RETRIES, up_res.error_msg
+                )).await;
                 continue;
             }
-            return Err(anyhow!("{}\n{}", log.join("\n"), last_error));
+            return Err(anyhow!("{}\nAll {} attempts failed. Last error: {}", log.join("\n"), MAX_ORDER_RETRIES, last_error));
         }
 
-        let up_res = &results[0];
-        let down_res = &results[1];
+        log.push(format!("UP order placed: {} (status={})", up_res.order_id, up_res.status));
 
-        // ── Both succeed → done ──────────────────────────────────────────
-        if up_res.success && down_res.success {
-            log.push(format!("UP order placed: {} (status={})", up_res.order_id, up_res.status));
+        // ── Now place DOWN order ─────────────────────────────────────────
+        // UP is confirmed accepted — the exchange has reserved balance for it.
+        // The remaining available balance should be enough for DOWN.
+        log.push("Building DOWN order...".to_string());
+        let down_salt = now_ms() as u64 + 1;
+        let down_order = build_order_request(wallet, down_asset_id, buy_shares, down_price, "BUY", fee_bps, down_salt).await?;
+
+        log.push("Submitting DOWN order...".to_string());
+        let down_res = match place_batch_orders(&client, wallet, vec![down_order]).await {
+            Ok(r) if r.len() == 1 => r.into_iter().next().unwrap(),
+            Ok(r) => {
+                let msg = format!("DOWN order: unexpected response length {}", r.len());
+                log.push(msg.clone());
+                // UP is placed but DOWN failed — retry DOWN once below
+                BatchOrderResult { success: false, order_id: String::new(), status: String::new(), error_msg: msg }
+            }
+            Err(e) => {
+                log.push(format!("DOWN order request failed: {:#}", e));
+                BatchOrderResult { success: false, order_id: String::new(), status: String::new(), error_msg: format!("{:#}", e) }
+            }
+        };
+
+        if down_res.success {
+            // Both legs placed successfully
             log.push(format!("DOWN order placed: {} (status={})", down_res.order_id, down_res.status));
             if attempt > 1 {
                 log.push(format!("Succeeded on attempt {}.", attempt));
             }
-            let total_spent = estimated_cost;
             return Ok((
-                TradeResult {
-                    shares_bought: buy_shares,
-                    total_spent,
-                },
+                TradeResult { shares_bought: buy_shares, total_spent: estimated_cost },
                 log.join("\n"),
             ));
         }
 
-        // ── UP succeeded, DOWN failed ────────────────────────────────────
-        // Fast path: retry just the failed DOWN leg before resorting to
-        // cancelling the successful UP order. This saves ~200ms (no cancel
-        // roundtrip) and keeps the already-matched UP leg intact.
-        if up_res.success && !down_res.success {
-            log.push(format!(
-                "UP order {} succeeded but DOWN FAILED: {}. Retrying DOWN leg...",
-                up_res.order_id, down_res.error_msg
-            ));
+        // ── DOWN failed — retry it once before cancelling UP ─────────────
+        log.push(format!("DOWN order failed: {}. Retrying DOWN...", down_res.error_msg));
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-            let retry_salt = now_ms() as u64 + 100;
-            let down_retry = build_order_request(
-                wallet, down_asset_id, buy_shares, down_price, "BUY", fee_bps, retry_salt,
-            ).await;
-
-            let retry_ok = match down_retry {
-                Ok(order) => {
-                    match place_batch_orders(&client, wallet, vec![order]).await {
-                        Ok(res) if res.len() == 1 && res[0].success => {
-                            log.push(format!(
-                                "DOWN retry succeeded: {} (status={})",
-                                res[0].order_id, res[0].status
-                            ));
-                            true
-                        }
-                        Ok(res) => {
-                            let msg = res.first().map(|r| r.error_msg.as_str()).unwrap_or("empty response");
-                            log.push(format!("DOWN retry also failed: {}", msg));
-                            false
-                        }
-                        Err(e) => {
-                            log.push(format!("DOWN retry request error: {:#}", e));
-                            false
-                        }
+        let retry_salt = now_ms() as u64 + 50;
+        let down_retry_ok = match build_order_request(wallet, down_asset_id, buy_shares, down_price, "BUY", fee_bps, retry_salt).await {
+            Ok(order) => {
+                match place_batch_orders(&client, wallet, vec![order]).await {
+                    Ok(res) if res.len() == 1 && res[0].success => {
+                        log.push(format!("DOWN retry succeeded: {} (status={})", res[0].order_id, res[0].status));
+                        true
+                    }
+                    Ok(res) => {
+                        let msg = res.first().map(|r| r.error_msg.as_str()).unwrap_or("empty");
+                        log.push(format!("DOWN retry also failed: {}", msg));
+                        false
+                    }
+                    Err(e) => {
+                        log.push(format!("DOWN retry request error: {:#}", e));
+                        false
                     }
                 }
-                Err(e) => {
-                    log.push(format!("DOWN retry build error: {:#}", e));
-                    false
-                }
-            };
-
-            if retry_ok {
-                // Both legs are now placed — success
-                log.push(format!("UP order placed: {} (status={})", up_res.order_id, up_res.status));
-                let total_spent = estimated_cost;
-                return Ok((
-                    TradeResult { shares_bought: buy_shares, total_spent },
-                    log.join("\n"),
-                ));
             }
-
-            // DOWN retry failed too — cancel the UP leg and fall through to full retry
-            log.push("DOWN retry failed. Cancelling UP order...".to_string());
-            match cancel_order(&client, wallet, &up_res.order_id).await {
-                Ok(_) => {
-                    log.push("UP order cancelled.".to_string());
-                    last_error = format!("DOWN failed: {}", down_res.error_msg);
-                    let _ = send_discord_webhook(&format!(
-                        "⚠ Partial failure (attempt {}/{}): DOWN order failed twice ({}). UP cancelled. {}",
-                        attempt, MAX_ORDER_RETRIES, down_res.error_msg,
-                        if attempt < MAX_ORDER_RETRIES { "Retrying both..." } else { "No more retries." }
-                    )).await;
-                    if attempt < MAX_ORDER_RETRIES { continue; }
-                }
-                Err(e) => {
-                    let alert = format!(
-                        "🚨 ALERT: Only UP order went through (id={}). Could not cancel: {:#}. DOWN error: {}",
-                        up_res.order_id, e, down_res.error_msg
-                    );
-                    log.push(alert.clone());
-                    let _ = send_discord_webhook(&alert).await;
-                    return Err(anyhow!("{}", log.join("\n")));
-                }
+            Err(e) => {
+                log.push(format!("DOWN retry build error: {:#}", e));
+                false
             }
-        }
-        // ── DOWN succeeded, UP failed ────────────────────────────────────
-        // Same fast-path: retry just the failed UP leg first.
-        else if !up_res.success && down_res.success {
-            log.push(format!(
-                "DOWN order {} succeeded but UP FAILED: {}. Retrying UP leg...",
-                down_res.order_id, up_res.error_msg
+        };
+
+        if down_retry_ok {
+            log.push(format!("Both legs placed (UP on first try, DOWN on retry)."));
+            return Ok((
+                TradeResult { shares_bought: buy_shares, total_spent: estimated_cost },
+                log.join("\n"),
             ));
-
-            let retry_salt = now_ms() as u64 + 200;
-            let up_retry = build_order_request(
-                wallet, up_asset_id, buy_shares, up_price, "BUY", fee_bps, retry_salt,
-            ).await;
-
-            let retry_ok = match up_retry {
-                Ok(order) => {
-                    match place_batch_orders(&client, wallet, vec![order]).await {
-                        Ok(res) if res.len() == 1 && res[0].success => {
-                            log.push(format!(
-                                "UP retry succeeded: {} (status={})",
-                                res[0].order_id, res[0].status
-                            ));
-                            true
-                        }
-                        Ok(res) => {
-                            let msg = res.first().map(|r| r.error_msg.as_str()).unwrap_or("empty response");
-                            log.push(format!("UP retry also failed: {}", msg));
-                            false
-                        }
-                        Err(e) => {
-                            log.push(format!("UP retry request error: {:#}", e));
-                            false
-                        }
-                    }
-                }
-                Err(e) => {
-                    log.push(format!("UP retry build error: {:#}", e));
-                    false
-                }
-            };
-
-            if retry_ok {
-                // Both legs are now placed — success
-                log.push(format!("DOWN order placed: {} (status={})", down_res.order_id, down_res.status));
-                let total_spent = estimated_cost;
-                return Ok((
-                    TradeResult { shares_bought: buy_shares, total_spent },
-                    log.join("\n"),
-                ));
-            }
-
-            // UP retry failed too — cancel the DOWN leg and fall through to full retry
-            log.push("UP retry failed. Cancelling DOWN order...".to_string());
-            match cancel_order(&client, wallet, &down_res.order_id).await {
-                Ok(_) => {
-                    log.push("DOWN order cancelled.".to_string());
-                    last_error = format!("UP failed: {}", up_res.error_msg);
-                    let _ = send_discord_webhook(&format!(
-                        "⚠ Partial failure (attempt {}/{}): UP order failed twice ({}). DOWN cancelled. {}",
-                        attempt, MAX_ORDER_RETRIES, up_res.error_msg,
-                        if attempt < MAX_ORDER_RETRIES { "Retrying both..." } else { "No more retries." }
-                    )).await;
-                    if attempt < MAX_ORDER_RETRIES { continue; }
-                }
-                Err(e) => {
-                    let alert = format!(
-                        "🚨 ALERT: Only DOWN order went through (id={}). Could not cancel: {:#}. UP error: {}",
-                        down_res.order_id, e, up_res.error_msg
-                    );
-                    log.push(alert.clone());
-                    let _ = send_discord_webhook(&alert).await;
-                    return Err(anyhow!("{}", log.join("\n")));
-                }
-            }
         }
-        // ── Both failed ──────────────────────────────────────────────────
-        else {
-            last_error = format!("Both orders failed: UP={}, DOWN={}", up_res.error_msg, down_res.error_msg);
-            log.push(last_error.clone());
-            let retry_note = if attempt < MAX_ORDER_RETRIES { "Retrying..." } else { "No more retries." };
-            let _ = send_discord_webhook(&format!(
-                "⚠ Both orders failed (attempt {}/{}): UP={}, DOWN={}. {}",
-                attempt, MAX_ORDER_RETRIES, up_res.error_msg, down_res.error_msg, retry_note
-            )).await;
-            if attempt < MAX_ORDER_RETRIES {
-                continue;
+
+        // DOWN failed twice — cancel UP and retry everything
+        log.push("DOWN failed twice. Cancelling UP order...".to_string());
+        match cancel_order(&client, wallet, &up_res.order_id).await {
+            Ok(_) => {
+                log.push("UP order cancelled.".to_string());
+                last_error = format!("DOWN failed: {}", down_res.error_msg);
+                let _ = send_discord_webhook(&format!(
+                    "⚠ DOWN order failed twice (attempt {}/{}): {}. UP cancelled. {}",
+                    attempt, MAX_ORDER_RETRIES, down_res.error_msg,
+                    if attempt < MAX_ORDER_RETRIES { "Retrying both..." } else { "No more retries." }
+                )).await;
+                if attempt < MAX_ORDER_RETRIES { continue; }
+            }
+            Err(e) => {
+                let alert = format!(
+                    "🚨 ALERT: Only UP order went through (id={}). Could not cancel: {:#}. DOWN error: {}",
+                    up_res.order_id, e, down_res.error_msg
+                );
+                log.push(alert.clone());
+                let _ = send_discord_webhook(&alert).await;
+                return Err(anyhow!("{}", log.join("\n")));
             }
         }
     }
