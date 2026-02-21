@@ -251,41 +251,11 @@ async fn main() -> Result<()> {
     check_and_top_up_pol(&client, &wallet).await
         .unwrap_or_else(|e| eprintln!("WARN: POL top-up check failed: {e:#}"));
 
-    // At startup, attempt to redeem positions from any previously resolved markets.
-    // This sweeps USDC back from settled CTF positions into the wallet.
-    // Uses condition_id from the most recently discovered market — older markets
-    // would need their own condition_ids, but in practice the bot only trades one
-    // market at a time and the first window it discovers is the active one.
+    // At startup, attempt to redeem positions from recently resolved markets.
+    // Markets need time for the oracle to call reportPayouts() before redeem works,
+    // so we scan windows that ended 5+ minutes ago (not the one that just closed).
     notify_important("Checking for redeemable CTF positions from prior windows...").await?;
-    {
-        let _startup_check = discover_active_btc_5m_market(&client).await;
-        // Try a few recent condition IDs by scanning recent slugs (last 3 windows = 15 min)
-        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-        let mut redeemed_any = false;
-        for i in 1..=6 {
-            let window_start = (now_secs / 300) * 300 - i * 300;
-            let slug = format!("btc-updown-5m-{window_start}");
-            let url = format!("{GAMMA_API}/markets?slug={slug}");
-            if let Ok(resp) = client.get(&url).send().await {
-                if let Ok(data) = resp.json::<Value>().await {
-                    if let Some(cid) = data.as_array()
-                        .and_then(|a| a.first())
-                        .and_then(|m| m.get("conditionId"))
-                        .and_then(|v| v.as_str())
-                    {
-                        println!("Attempting redeem for prior window: {slug} (conditionId={cid})");
-                        match redeem_positions(&private_key, cid).await {
-                            Ok(_) => { redeemed_any = true; }
-                            Err(e) => eprintln!("Redeem skipped for {slug}: {e:#}"),
-                        }
-                    }
-                }
-            }
-        }
-        if !redeemed_any {
-            println!("No prior redeemable positions found.");
-        }
-    }
+    redeem_prior_windows(&client, &private_key).await;
 
     // Initialize money manager
     let money: Arc<Mutex<MoneyManager>> = Arc::new(Mutex::new(MoneyManager {
@@ -537,63 +507,65 @@ async fn main() -> Result<()> {
                 }
 
                 if window_closed {
-                    // Save slug + conditionId before the next discover overwrites state.
-                    let (slug_to_redeem, condition_id_to_redeem) = {
+                    let slug_closing = {
                         let guard = state.lock().await;
-                        (guard.market_slug.clone(), guard.condition_id.clone())
-                    };
-                    println!(
-                        "Attempting redemption for closed window {} (conditionId={})...",
-                        slug_to_redeem, condition_id_to_redeem
-                    );
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    let redeem_ok = match redeem_positions(&private_key, &condition_id_to_redeem).await {
-                        Ok(_) => true,
-                        Err(e) => {
-                            eprintln!("WARN: Redeem after window close failed: {e:#}");
-                            false
-                        }
+                        guard.market_slug.clone()
                     };
 
-                    // Fetch balance after redeem for profit calculation
-                    let (balance_after, profit) = match get_balance(&client, &wallet.address).await {
-                        Ok(bal) => {
-                            let m = money.lock().await;
-                            let p = bal - m.balance_at_window_start;
-                            (format!("${:.4}", bal), p)
-                        }
-                        Err(e) => {
-                            eprintln!("WARN: Could not fetch balance after redeem: {e:#}");
-                            ("N/A".to_string(), 0.0)
-                        }
+                    // Window-close embed — show what we spent this window
+                    let (balance_now, spent) = {
+                        let m = money.lock().await;
+                        let bal = get_balance(&client, &wallet.address).await.unwrap_or(0.0);
+                        (bal, m.money_spent)
                     };
-
                     let m = money.lock().await;
-                    let profit_str = format!("{}{:.4}", if profit >= 0.0 { "+$" } else { "-$" }, profit.abs());
-                    let color = if profit >= 0.0 { 0x2ECC71 } else { 0xE74C3C };
                     let embed = json!({
                         "title": "Window Closed",
-                        "color": color,
+                        "color": 0x95A5A6,
                         "fields": [
-                            { "name": "Slug", "value": &slug_to_redeem, "inline": false },
+                            { "name": "Slug", "value": &slug_closing, "inline": false },
                             { "name": "Close Reason", "value": close_reason, "inline": true },
-                            { "name": "Redeemed", "value": if redeem_ok { "Yes" } else { "Failed" }, "inline": true },
-                            { "name": "Profit", "value": &profit_str, "inline": true },
-                            { "name": "Balance Before", "value": format!("${:.4}", m.balance_at_window_start), "inline": true },
-                            { "name": "Balance After", "value": &balance_after, "inline": true },
+                            { "name": "Balance", "value": format!("${:.4}", balance_now), "inline": true },
                             { "name": "Total Spent", "value": format!("${:.4}", m.money_spent), "inline": true },
                             { "name": "Trades", "value": format!("{}", m.total_buy_positions), "inline": true },
                             { "name": "Total Shares", "value": format!("{}", m.total_shares_bought), "inline": true }
                         ],
-                        "footer": { "text": "Polymarket Arbitrage Bot" }
+                        "footer": { "text": "Redemption happens on next cycle once oracle resolves the market" }
                     });
                     drop(m);
-                    println!("Window closed: {slug_to_redeem} | profit={profit_str} | balance={balance_after}");
+                    println!("Window closed: {slug_closing} | spent=${:.4} | balance=${:.4}", spent, balance_now);
                     if let Err(e) = send_discord_embed(embed).await {
                         eprintln!("Discord window-close embed failed: {e:#}");
                     }
 
-                    // After each redeem, refill POL if running low
+                    // Redeem OLDER windows that the oracle has had time to resolve.
+                    // The window that just closed is too fresh — skip it (index starts at 2).
+                    let redeemed = redeem_prior_windows(&client, &private_key).await;
+
+                    // If anything was redeemed, show the new balance
+                    if redeemed > 0 {
+                        if let Ok(bal) = get_balance(&client, &wallet.address).await {
+                            let bal_before = money.lock().await.balance_at_window_start;
+                            let profit = bal - bal_before;
+                            let profit_str = format!("{}{:.4}", if profit >= 0.0 { "+$" } else { "-$" }, profit.abs());
+                            let color = if profit >= 0.0 { 0x2ECC71 } else { 0xE74C3C };
+                            let embed = json!({
+                                "title": "Positions Redeemed",
+                                "color": color,
+                                "fields": [
+                                    { "name": "Windows Redeemed", "value": format!("{}", redeemed), "inline": true },
+                                    { "name": "Profit", "value": &profit_str, "inline": true },
+                                    { "name": "New Balance", "value": format!("${:.4}", bal), "inline": true }
+                                ],
+                                "footer": { "text": "Polymarket Arbitrage Bot" }
+                            });
+                            if let Err(e) = send_discord_embed(embed).await {
+                                eprintln!("Discord redeem embed failed: {e:#}");
+                            }
+                        }
+                    }
+
+                    // Refill POL if running low
                     check_and_top_up_pol(&client, &wallet).await
                         .unwrap_or_else(|e| eprintln!("WARN: POL top-up check failed: {e:#}"));
                 }
@@ -1341,6 +1313,65 @@ async fn redeem_positions(
         resp.transaction_hash, resp.block_number
     );
     Ok(())
+}
+
+/// Scans the last 6 windows (skipping the most recent one — too fresh for oracle)
+/// and attempts to redeem positions from any that have been resolved.
+/// Returns the count of successfully redeemed windows.
+async fn redeem_prior_windows(client: &Client, private_key: &str) -> u32 {
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let mut redeemed = 0u32;
+
+    // Start from i=2 (10 min ago) — give the oracle at least one full window to resolve.
+    // Go back up to 6 windows (30 min).
+    for i in 2..=6 {
+        let window_start = (now_secs / 300) * 300 - i * 300;
+        let slug = format!("btc-updown-5m-{window_start}");
+        let url = format!("{GAMMA_API}/markets?slug={slug}");
+
+        let cid = match client.get(&url).send().await {
+            Ok(resp) => match resp.json::<Value>().await {
+                Ok(data) => data
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|m| m.get("conditionId"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                Err(_) => None,
+            },
+            Err(_) => None,
+        };
+
+        if let Some(cid) = cid {
+            println!("Attempting redeem for prior window: {slug} (conditionId={cid})");
+            match redeem_positions(private_key, &cid).await {
+                Ok(_) => {
+                    redeemed += 1;
+                }
+                Err(e) => {
+                    // "execution reverted" is normal for unresolved or already-redeemed markets
+                    let msg = format!("{e:#}");
+                    if msg.contains("revert") || msg.contains("insufficient") {
+                        println!("Redeem skipped for {slug}: not resolved or already redeemed");
+                    } else {
+                        eprintln!("Redeem failed for {slug}: {e:#}");
+                    }
+                }
+            }
+        }
+    }
+
+    if redeemed == 0 {
+        println!("No prior windows redeemed (not yet resolved or already redeemed).");
+    } else {
+        println!("Redeemed {redeemed} prior window(s).");
+    }
+
+    redeemed
 }
 
 async fn get_balance(client: &Client, address: &Address) -> Result<f64> {
