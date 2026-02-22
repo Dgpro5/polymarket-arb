@@ -1154,16 +1154,47 @@ async fn execute_arbitrage_trade(
         .into());
     }
 
-    // ── Order book depth ─────────────────────────────────────────────────
+    // ── Order book depth + fresh best-ask prices ──────────────────────
     let up_book = get_order_book(&client, up_asset_id).await?;
     let up_depth = calculate_total_size(&up_book.asks)?;
     let down_book = get_order_book(&client, down_asset_id).await?;
     let down_depth = calculate_total_size(&down_book.asks)?;
 
+    // Use the ACTUAL best ask from the freshly fetched order book, not the
+    // stale midpoint from the WebSocket.  The midpoint can sit below the ask
+    // (e.g. bid=0.38 ask=0.42 → mid=0.40) causing FOK BUYs to fail.
+    let up_best_ask: f64 = up_book
+        .asks
+        .first()
+        .and_then(|l| l.price.parse().ok())
+        .unwrap_or(up_price);
+    let down_best_ask: f64 = down_book
+        .asks
+        .first()
+        .and_then(|l| l.price.parse().ok())
+        .unwrap_or(down_price);
+
+    // Re-check profitability with real ask prices + buffer (worst case)
+    let up_buffered = up_best_ask + FOK_PRICE_BUFFER;
+    let down_buffered = down_best_ask + FOK_PRICE_BUFFER;
+    let worst_case_sum_trade = (up_buffered + down_buffered) * 100.0;
+    let trade_threshold = if fee_bps > 0 {
+        100.0 / (1.0 + fee_bps as f64 / 10000.0)
+    } else {
+        MIN_PROFIT_THRESHOLD_FALLBACK
+    };
+    if worst_case_sum_trade >= trade_threshold {
+        return Err(anyhow!(
+            "Not profitable at real ask prices: UP ask={:.2}c, DOWN ask={:.2}c, \
+             buffered sum={:.2}c >= threshold {:.2}c",
+            up_best_ask * 100.0,
+            down_best_ask * 100.0,
+            worst_case_sum_trade,
+            trade_threshold
+        ));
+    }
+
     let liquidity_shares = (up_depth.min(down_depth) * 0.8).floor();
-    // Use buffered prices for cost estimation (worst-case spending)
-    let up_buffered = up_price + FOK_PRICE_BUFFER;
-    let down_buffered = down_price + FOK_PRICE_BUFFER;
     let cost_per_pair = up_buffered + down_buffered;
     let affordable_shares = ((balance - MIN_BALANCE_USDC) / cost_per_pair).floor();
     let buy_shares = liquidity_shares.min(affordable_shares) as u64;
