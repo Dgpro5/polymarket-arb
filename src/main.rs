@@ -1065,6 +1065,15 @@ async fn execute_arbitrage_trade(
     if !up_res.success {
         return Err(anyhow!("UP rejected: {}", up_res.error_msg));
     }
+    if up_res.status != "MATCHED" {
+        // FOK order was accepted but not fully filled — should not happen with
+        // FOK, but guard against it.  Cancel to avoid a dangling resting order.
+        let _ = cancel_order(&client, wallet, &up_res.order_id).await;
+        return Err(anyhow!(
+            "UP order not fully filled (status={}). Cancelled {}.",
+            up_res.status, up_res.order_id
+        ));
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
     //  Re-fetch fee rate before second order
@@ -1079,8 +1088,8 @@ async fn execute_arbitrage_trade(
     let down_res = place_single_order(&client, wallet, down_order).await;
 
     if let Ok(ref r) = down_res {
-        if r.success {
-            let balance_after = get_balance(&client, &wallet.address).await.unwrap_or(balance - estimated_cost);
+        if r.success && r.status == "MATCHED" {
+            let balance_after = balance - estimated_cost;
             return Ok((
                 TradeResult { shares_bought: buy_shares, total_spent: estimated_cost },
                 TradeDetails {
@@ -1109,8 +1118,8 @@ async fn execute_arbitrage_trade(
     let down_retry_res = place_single_order(&client, wallet, down_retry_order).await;
 
     if let Ok(ref r) = down_retry_res {
-        if r.success {
-            let balance_after = get_balance(&client, &wallet.address).await.unwrap_or(balance - estimated_cost);
+        if r.success && r.status == "MATCHED" {
+            let balance_after = balance - estimated_cost;
             return Ok((
                 TradeResult { shares_bought: buy_shares, total_spent: estimated_cost },
                 TradeDetails {
@@ -1744,7 +1753,7 @@ async fn build_order_request(
     Ok(CreateOrderRequest {
         order,
         owner: wallet.creds.api_key.clone(),
-        order_type: "GTC".to_string(),
+        order_type: "FOK".to_string(),
         defer_exec: false,
     })
 }
