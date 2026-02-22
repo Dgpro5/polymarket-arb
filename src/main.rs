@@ -62,22 +62,25 @@ struct Candle {
     high: f64,
     low: f64,
     last_price: f64,
+    /// Best ask from the WebSocket — the actual price we'd pay for a BUY.
+    last_ask: f64,
     last_update_ms: i64,
 }
 
 impl Candle {
-    fn new(start_ms: i64, price: f64, ts: i64) -> Self {
+    fn new(start_ms: i64, price: f64, ask: f64, ts: i64) -> Self {
         Self {
             start_ms,
             end_ms: start_ms + CANDLE_MS,
             high: price,
             low: price,
             last_price: price,
+            last_ask: ask,
             last_update_ms: ts,
         }
     }
 
-    fn update(&mut self, price: f64, ts: i64) {
+    fn update(&mut self, price: f64, ask: f64, ts: i64) {
         if price > self.high {
             self.high = price;
         }
@@ -85,6 +88,7 @@ impl Candle {
             self.low = price;
         }
         self.last_price = price;
+        self.last_ask = ask;
         self.last_update_ms = ts;
     }
 }
@@ -757,18 +761,18 @@ async fn handle_clob_message_single(
 
     match event_type {
         "best_bid_ask" => {
-            if let Some((asset_id, price, ts)) = parse_best_bid_ask(value) {
-                update_outcome_price(state, money, wallet, &asset_id, price, ts).await?;
+            if let Some((asset_id, price, ask, ts)) = parse_best_bid_ask(value) {
+                update_outcome_price(state, money, wallet, &asset_id, price, Some(ask), ts).await?;
             }
         }
         "last_trade_price" => {
             if let Some((asset_id, price, ts)) = parse_last_trade(value) {
-                update_outcome_price(state, money, wallet, &asset_id, price, ts).await?;
+                update_outcome_price(state, money, wallet, &asset_id, price, None, ts).await?;
             }
         }
         "book" => {
             if let Some((asset_id, price, ts)) = parse_book_mid(value) {
-                update_outcome_price(state, money, wallet, &asset_id, price, ts).await?;
+                update_outcome_price(state, money, wallet, &asset_id, price, None, ts).await?;
             }
         }
         "price_change" => {
@@ -781,7 +785,7 @@ async fn handle_clob_message_single(
                 if let Some(changes) = changes {
                     for change in changes {
                         if let Some((asset_id, price)) = parse_price_change(change, root_asset) {
-                            update_outcome_price(state, money, wallet, &asset_id, price, ts)
+                            update_outcome_price(state, money, wallet, &asset_id, price, None, ts)
                                 .await?;
                         }
                     }
@@ -794,7 +798,8 @@ async fn handle_clob_message_single(
     Ok(())
 }
 
-fn parse_best_bid_ask(value: &Value) -> Option<(String, f64, i64)> {
+/// Returns (asset_id, midpoint, best_ask, timestamp).
+fn parse_best_bid_ask(value: &Value) -> Option<(String, f64, f64, i64)> {
     let asset_id = value.get("asset_id")?.as_str()?.to_string();
     let best_bid = value
         .get("best_bid")
@@ -813,7 +818,10 @@ fn parse_best_bid_ask(value: &Value) -> Option<(String, f64, i64)> {
         (None, None) => return None,
     };
 
-    Some((asset_id, price, ts))
+    // For the ask, fall back to the midpoint if no ask is available.
+    let ask = best_ask.unwrap_or(price);
+
+    Some((asset_id, price, ask, ts))
 }
 
 fn parse_last_trade(value: &Value) -> Option<(String, f64, i64)> {
@@ -896,9 +904,12 @@ async fn update_outcome_price(
     wallet: &Arc<TradingWallet>,
     asset_id: &str,
     price: f64,
+    ask: Option<f64>,
     ts: i64,
 ) -> Result<()> {
     let start_ms = ts - (ts % CANDLE_MS);
+    // If no ask provided (e.g. last_trade_price), use the price as fallback.
+    let ask = ask.unwrap_or(price);
 
     let mut guard = state.lock().await;
     if !guard.asset_to_outcome.contains_key(asset_id) {
@@ -909,18 +920,18 @@ async fn update_outcome_price(
 
     match guard.candles.get_mut(asset_id) {
         Some(candle) if candle.start_ms == start_ms => {
-            candle.update(price, ts);
+            candle.update(price, ask, ts);
         }
         Some(prev) => {
             finished = Some(prev.clone());
             guard
                 .candles
-                .insert(asset_id.to_string(), Candle::new(start_ms, price, ts));
+                .insert(asset_id.to_string(), Candle::new(start_ms, price, ask, ts));
         }
         None => {
             guard
                 .candles
-                .insert(asset_id.to_string(), Candle::new(start_ms, price, ts));
+                .insert(asset_id.to_string(), Candle::new(start_ms, price, ask, ts));
         }
     }
 
@@ -939,9 +950,10 @@ async fn print_up_down(
 ) -> Result<()> {
     let mut up_id = None;
     let mut up_price = None;
+    let mut up_ask = None;
     let mut down_id = None;
     let mut down_price = None;
-    let mut ts = None;
+    let mut down_ask = None;
 
     for (asset_id, candle) in state.candles.iter() {
         let outcome = state
@@ -952,11 +964,11 @@ async fn print_up_down(
         if outcome.eq_ignore_ascii_case("up") {
             up_id = Some(asset_id.clone());
             up_price = Some(candle.last_price);
-            ts = Some(candle.last_update_ms);
+            up_ask = Some(candle.last_ask);
         } else if outcome.eq_ignore_ascii_case("down") {
             down_id = Some(asset_id.clone());
             down_price = Some(candle.last_price);
-            ts = Some(candle.last_update_ms);
+            down_ask = Some(candle.last_ask);
         }
     }
 
@@ -1005,12 +1017,18 @@ async fn print_up_down(
             LAST_DETECTION_MS.store(now, Ordering::Relaxed);
 
             // Ensure the lock is always released, even on early returns/panics.
+            // Use WebSocket best-ask prices for orders (low latency).
+            // Round to tick size, fall back to midpoint if ask unavailable.
+            let up_ask_price = ((up_ask.unwrap_or(up) * 100.0).round()) / 100.0;
+            let down_ask_price = ((down_ask.unwrap_or(down) * 100.0).round()) / 100.0;
             let trade_result = execute_arbitrage_trade(
                 wallet,
                 &up_asset,
                 &down_asset,
                 up,
                 down,
+                up_ask_price,
+                down_ask_price,
                 sum_cents,
                 fee_bps,
             )
@@ -1131,8 +1149,10 @@ async fn execute_arbitrage_trade(
     wallet: &Arc<TradingWallet>,
     up_asset_id: &str,
     down_asset_id: &str,
-    up_price: f64,
-    down_price: f64,
+    _up_price: f64,
+    _down_price: f64,
+    up_ask: f64,
+    down_ask: f64,
     _sum_cents: f64,
     fee_bps: u64,
 ) -> Result<(TradeResult, TradeDetails)> {
@@ -1150,21 +1170,14 @@ async fn execute_arbitrage_trade(
         .into());
     }
 
-    // ── Order book depth ─────────────────────────────────────────────────
+    // ── Order book depth (REST) — only used for sizing, NOT pricing ─────
     let up_book = get_order_book(&client, up_asset_id).await?;
     let up_depth = calculate_total_size(&up_book.asks)?;
     let down_book = get_order_book(&client, down_asset_id).await?;
     let down_depth = calculate_total_size(&down_book.asks)?;
 
     let liquidity_shares = (up_depth.min(down_depth) * 0.8).floor();
-    // Use best-ask for initial cost estimate (refined below with fill price)
-    let up_best_ask: f64 = up_book.asks.first()
-        .and_then(|l| l.price.parse().ok())
-        .unwrap_or(up_price);
-    let down_best_ask: f64 = down_book.asks.first()
-        .and_then(|l| l.price.parse().ok())
-        .unwrap_or(down_price);
-    let cost_per_pair = up_best_ask + down_best_ask;
+    let cost_per_pair = up_ask + down_ask;
     let affordable_shares = ((balance - MIN_BALANCE_USDC) / cost_per_pair).floor();
     let buy_shares = liquidity_shares.min(affordable_shares) as u64;
 
@@ -1180,191 +1193,141 @@ async fn execute_arbitrage_trade(
         ));
     }
 
-    // ── Walk the book to find the exact fill price for our share count ───
-    let up_fill_price = calculate_fill_price(&up_book.asks, buy_shares)
-        .ok_or_else(|| anyhow!(
-            "UP book too thin: need {} shares but only {:.0} available",
-            buy_shares, up_depth
-        ))?;
-    let down_fill_price = calculate_fill_price(&down_book.asks, buy_shares)
-        .ok_or_else(|| anyhow!(
-            "DOWN book too thin: need {} shares but only {:.0} available",
-            buy_shares, down_depth
-        ))?;
-
-    // Re-check profitability at the actual fill prices (worst case)
-    let fill_sum_cents = (up_fill_price + down_fill_price) * 100.0;
-    let trade_threshold = if fee_bps > 0 {
-        100.0 / (1.0 + fee_bps as f64 / 10000.0)
-    } else {
-        MIN_PROFIT_THRESHOLD_FALLBACK
-    };
-    if fill_sum_cents >= trade_threshold {
-        return Err(anyhow!(
-            "Not profitable at fill prices: UP={:.2}c, DOWN={:.2}c, \
-             sum={:.2}c >= threshold {:.2}c",
-            up_fill_price * 100.0,
-            down_fill_price * 100.0,
-            fill_sum_cents,
-            trade_threshold
-        ));
-    }
-
-    let estimated_cost = (up_fill_price + down_fill_price) * (buy_shares as f64);
+    let estimated_cost = cost_per_pair * (buy_shares as f64);
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  ORDER 1: UP
+    //  Place the THINNER side first.  If it gets killed we haven't committed
+    //  any capital, so there's nothing to unwind.  The thicker side placed
+    //  second is more likely to fill.
     // ═══════════════════════════════════════════════════════════════════════
-    let up_salt = now_ms() as u64;
-    let up_order = build_order_request(
-        wallet,
-        up_asset_id,
-        buy_shares,
-        up_fill_price,
-        "BUY",
-        fee_bps,
-        up_salt,
+    let (first_id, first_ask, first_label,
+         second_id, second_ask, second_label) =
+        if up_depth <= down_depth {
+            (up_asset_id, up_ask, "UP",
+             down_asset_id, down_ask, "DOWN")
+        } else {
+            (down_asset_id, down_ask, "DOWN",
+             up_asset_id, up_ask, "UP")
+        };
+
+    // ── LEG 1: thinner side ─────────────────────────────────────────────
+    let first_salt = now_ms() as u64;
+    let first_order = build_order_request(
+        wallet, first_id, buy_shares, first_ask, "BUY", fee_bps, first_salt,
     )
     .await?;
-    let up_res = place_single_order(&client, wallet, up_order)
+    let first_res = place_single_order(&client, wallet, first_order)
         .await
-        .context("UP order request failed")?;
+        .with_context(|| format!("{} order request failed", first_label))?;
 
-    if !up_res.success {
-        return Err(anyhow!("UP rejected: {}", up_res.error_msg));
+    if !first_res.success {
+        return Err(anyhow!("{} rejected: {}", first_label, first_res.error_msg));
     }
-    if up_res.status != "MATCHED" {
-        // FOK order was accepted but not fully filled — should not happen with
-        // FOK, but guard against it.  Cancel to avoid a dangling resting order.
-        let _ = cancel_order(&client, wallet, &up_res.order_id).await;
+    if first_res.status != "MATCHED" {
+        let _ = cancel_order(&client, wallet, &first_res.order_id).await;
         return Err(anyhow!(
-            "UP order not fully filled (status={}). Cancelled {}.",
-            up_res.status,
-            up_res.order_id
+            "{} order not fully filled (status={}). Cancelled {}.",
+            first_label, first_res.status, first_res.order_id
         ));
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Re-fetch fee rate before second order
-    // ═══════════════════════════════════════════════════════════════════════
-    let down_fee_bps = get_fee_rate(&client, down_asset_id)
+    // ── Re-fetch fee rate before second order ───────────────────────────
+    let second_fee_bps = get_fee_rate(&client, second_id)
         .await
         .unwrap_or(fee_bps);
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  ORDER 2: DOWN
-    // ═══════════════════════════════════════════════════════════════════════
-    let down_salt = now_ms() as u64 + 1;
-    let down_order = build_order_request(
-        wallet,
-        down_asset_id,
-        buy_shares,
-        down_fill_price,
-        "BUY",
-        down_fee_bps,
-        down_salt,
+    // ── LEG 2: thicker side ─────────────────────────────────────────────
+    let second_salt = now_ms() as u64 + 1;
+    let second_order = build_order_request(
+        wallet, second_id, buy_shares, second_ask, "BUY", second_fee_bps, second_salt,
     )
     .await?;
-    let down_res = place_single_order(&client, wallet, down_order).await;
+    let second_res = place_single_order(&client, wallet, second_order).await;
 
-    if let Ok(ref r) = down_res {
+    if let Ok(ref r) = second_res {
         if r.success && r.status == "MATCHED" {
             let balance_after = balance - estimated_cost;
+            // Map first/second back to up/down for TradeDetails
+            let (up_oid, up_st, down_oid, down_st, up_fee, down_fee) =
+                if first_label == "UP" {
+                    (first_res.order_id.clone(), first_res.status.clone(),
+                     r.order_id.clone(), r.status.clone(), fee_bps, second_fee_bps)
+                } else {
+                    (r.order_id.clone(), r.status.clone(),
+                     first_res.order_id.clone(), first_res.status.clone(), second_fee_bps, fee_bps)
+                };
             return Ok((
-                TradeResult {
-                    shares_bought: buy_shares,
-                    total_spent: estimated_cost,
-                },
+                TradeResult { shares_bought: buy_shares, total_spent: estimated_cost },
                 TradeDetails {
-                    balance_before: balance,
-                    balance_after,
-                    up_order_id: up_res.order_id.clone(),
-                    up_status: up_res.status.clone(),
-                    down_order_id: r.order_id.clone(),
-                    down_status: r.status.clone(),
-                    up_fee_bps: fee_bps,
-                    down_fee_bps,
-                    up_depth,
-                    down_depth,
-                    down_retried: false,
+                    balance_before: balance, balance_after,
+                    up_order_id: up_oid, up_status: up_st,
+                    down_order_id: down_oid, down_status: down_st,
+                    up_fee_bps: up_fee, down_fee_bps: down_fee,
+                    up_depth, down_depth, down_retried: false,
                 },
             ));
         }
     }
 
-    // ── DOWN failed — extract error, retry once ──────────────────────────
-    let down_err_1 = match &down_res {
+    // ── LEG 2 failed — retry once ───────────────────────────────────────
+    let err_1 = match &second_res {
         Ok(r) => r.error_msg.clone(),
         Err(e) => format!("{:#}", e),
     };
-    eprintln!("DOWN failed: {} | Retrying in 150ms...", down_err_1);
+    eprintln!("{} failed: {} | Retrying in 150ms...", second_label, err_1);
     tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
 
-    let retry_fee = get_fee_rate(&client, down_asset_id)
+    let retry_fee = get_fee_rate(&client, second_id)
         .await
-        .unwrap_or(down_fee_bps);
-    // Re-fetch the book for a fresh fill price on retry
-    let retry_down_book = get_order_book(&client, down_asset_id).await?;
-    let retry_fill_price = calculate_fill_price(&retry_down_book.asks, buy_shares)
-        .ok_or_else(|| anyhow!("DOWN book too thin on retry: need {} shares", buy_shares))?;
+        .unwrap_or(second_fee_bps);
     let retry_salt = now_ms() as u64 + 50;
-    let down_retry_order = build_order_request(
-        wallet,
-        down_asset_id,
-        buy_shares,
-        retry_fill_price,
-        "BUY",
-        retry_fee,
-        retry_salt,
+    let retry_order = build_order_request(
+        wallet, second_id, buy_shares, second_ask, "BUY", retry_fee, retry_salt,
     )
     .await?;
-    let down_retry_res = place_single_order(&client, wallet, down_retry_order).await;
+    let retry_res = place_single_order(&client, wallet, retry_order).await;
 
-    if let Ok(ref r) = down_retry_res {
+    if let Ok(ref r) = retry_res {
         if r.success && r.status == "MATCHED" {
             let balance_after = balance - estimated_cost;
+            let (up_oid, up_st, down_oid, down_st, up_fee, down_fee) =
+                if first_label == "UP" {
+                    (first_res.order_id.clone(), first_res.status.clone(),
+                     r.order_id.clone(), r.status.clone(), fee_bps, retry_fee)
+                } else {
+                    (r.order_id.clone(), r.status.clone(),
+                     first_res.order_id.clone(), first_res.status.clone(), retry_fee, fee_bps)
+                };
             return Ok((
-                TradeResult {
-                    shares_bought: buy_shares,
-                    total_spent: estimated_cost,
-                },
+                TradeResult { shares_bought: buy_shares, total_spent: estimated_cost },
                 TradeDetails {
-                    balance_before: balance,
-                    balance_after,
-                    up_order_id: up_res.order_id.clone(),
-                    up_status: up_res.status.clone(),
-                    down_order_id: r.order_id.clone(),
-                    down_status: r.status.clone(),
-                    up_fee_bps: fee_bps,
-                    down_fee_bps: retry_fee,
-                    up_depth,
-                    down_depth,
-                    down_retried: true,
+                    balance_before: balance, balance_after,
+                    up_order_id: up_oid, up_status: up_st,
+                    down_order_id: down_oid, down_status: down_st,
+                    up_fee_bps: up_fee, down_fee_bps: down_fee,
+                    up_depth, down_depth, down_retried: true,
                 },
             ));
         }
     }
 
-    // ── DOWN failed twice — UP is already FILLED (FOK+MATCHED) ─────────
-    // A cancel is useless because the FOK order already executed.
-    // We must SELL the UP shares back to unwind the one-sided position.
-    let down_err_2 = match &down_retry_res {
+    // ── LEG 2 failed twice — LEG 1 is filled, must sell back ────────────
+    let err_2 = match &retry_res {
         Ok(r) => r.error_msg.clone(),
         Err(e) => format!("{:#}", e),
     };
     eprintln!(
-        "DOWN failed twice: 1st={} | 2nd={} | Selling back {} UP shares to unwind",
-        down_err_1, down_err_2, buy_shares
+        "{} failed twice: 1st={} | 2nd={} | Selling back {} {} shares to unwind",
+        second_label, err_1, err_2, buy_shares, first_label
     );
 
-    // Fetch the current UP order book so we can sell into the bids.
-    let sell_result = sell_back_shares(&client, wallet, up_asset_id, buy_shares, fee_bps).await;
+    let sell_result = sell_back_shares(&client, wallet, first_id, buy_shares, fee_bps).await;
 
     match sell_result {
         Ok(sell_order_id) => {
             let msg = format!(
-                "DOWN failed twice (1st: {} | 2nd: {}). Sold {} UP shares back (order {}). No net position.",
-                down_err_1, down_err_2, buy_shares, sell_order_id
+                "{} failed twice (1st: {} | 2nd: {}). Sold {} {} shares back (order {}). No net position.",
+                second_label, err_1, err_2, buy_shares, first_label, sell_order_id
             );
             eprintln!("{}", msg);
             let _ = send_discord_webhook(&msg).await;
@@ -1372,9 +1335,9 @@ async fn execute_arbitrage_trade(
         }
         Err(sell_err) => {
             let msg = format!(
-                "CRITICAL: UP {} filled {} shares, DOWN failed ({}), SELL-BACK ALSO FAILED: {:#}. \
+                "CRITICAL: {} {} filled {} shares, {} failed ({}), SELL-BACK ALSO FAILED: {:#}. \
                  UNBALANCED POSITION — manual intervention required!",
-                up_res.order_id, buy_shares, down_err_2, sell_err
+                first_label, first_res.order_id, buy_shares, second_label, err_2, sell_err
             );
             eprintln!("{}", msg);
             let _ = send_discord_webhook(&msg).await;
@@ -1480,23 +1443,6 @@ fn calculate_total_size(levels: &[OrderBookLevel]) -> Result<f64> {
         .sum();
 
     Ok(total_size)
-}
-
-/// Walk the ask side of the order book to find the worst price level needed
-/// to fill `shares` via a FOK BUY.  Asks are sorted ascending (best first).
-/// Returns `None` if the book doesn't have enough depth.
-fn calculate_fill_price(asks: &[OrderBookLevel], shares: u64) -> Option<f64> {
-    let mut remaining = shares as f64;
-
-    for level in asks {
-        let price: f64 = level.price.parse().ok()?;
-        let size: f64 = level.size.parse().ok()?;
-        remaining -= size;
-        if remaining <= 0.0 {
-            return Some(price);
-        }
-    }
-    None // not enough depth for FOK
 }
 
 // ── CTF Position Redemption (via polymarket-client-sdk) ──────────────────────
