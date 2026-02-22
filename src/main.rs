@@ -1,30 +1,34 @@
-use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::URL_SAFE as BASE64, Engine};
+use alloy::providers::ProviderBuilder;
+use alloy::signers::Signer as _;
+use alloy::signers::local::LocalSigner;
+use anyhow::{Context, Error, Result, anyhow};
+use base64::{Engine, engine::general_purpose::URL_SAFE as BASE64};
+use ethers::prelude::*;
+use ethers::signers::{LocalWallet, Signer};
+use ethers::utils::keccak256;
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
+use polymarket_client_sdk::POLYGON;
+use polymarket_client_sdk::ctf::{Client as CtfClient, types::RedeemPositionsRequest};
+use polymarket_client_sdk::types::{Address as AlloyAddress, B256, U256 as AlloyU256};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::env;
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::sync::{Arc, atomic::{AtomicI64, Ordering}};
+use std::str::FromStr;
+use std::sync::{
+    Arc,
+    atomic::{AtomicI64, Ordering},
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
-use ethers::prelude::*;
-use ethers::signers::{LocalWallet, Signer};
-use ethers::utils::keccak256;
-use alloy::providers::ProviderBuilder;
-use alloy::signers::local::LocalSigner;
-use alloy::signers::Signer as _;
-use polymarket_client_sdk::ctf::{types::RedeemPositionsRequest, Client as CtfClient};
-use polymarket_client_sdk::types::{Address as AlloyAddress, B256, U256 as AlloyU256};
-use polymarket_client_sdk::POLYGON;
-use std::str::FromStr;
 
 const GAMMA_API: &str = "https://gamma-api.polymarket.com";
 const CLOB_API: &str = "https://clob.polymarket.com";
@@ -34,6 +38,7 @@ const DATA_DIR: &str = "data";
 const LATEST_PATH: &str = "data/btc_updown_5m_latest.json";
 const CSV_PATH: &str = "data/btc_updown_5m_candles.csv";
 const DISCORD_WEBHOOK_URL: &str = "https://discord.com/api/webhooks/1473284259363164211/4sgTuuoGlwS4OyJ5x6-QmpPA_Q1gvsIZB9EZrb9zWX6qyA0LMQklz3IupBfINPVnpsMZ";
+const ERROR_DISCORD_WEBHOOK_URL: &str = "https://discord.com/api/webhooks/1475092817654055084/_mr0tTCdzyyoJtTBwNqE6KYj6SQ0XEegZFv4j5PejJ0vq2i1Vlt0oi7IFmeAt12j0TQW";
 const DETECTION_COOLDOWN_MS: i64 = 5_000; // 5 seconds — prevent rapid sequential trades
 
 const PRIVATE_KEY_ENV: &str = "PRIVATE_KEY";
@@ -43,7 +48,7 @@ const PRIVATE_KEY_ENV: &str = "PRIVATE_KEY";
 // Formula: sum_cents < 100.0 / (1.0 + fee_bps / 10000.0)
 // This constant is a hard fallback only used if the fee fetch fails.
 const MIN_PROFIT_THRESHOLD_FALLBACK: f64 = 90.0;
-const SLIPPAGE_TOLERANCE: f64 = 0.02;   // 2% slippage tolerance
+const SLIPPAGE_TOLERANCE: f64 = 0.02; // 2% slippage tolerance
 
 static LAST_DETECTION_MS: AtomicI64 = AtomicI64::new(0);
 /// Global trade lock — prevents a second trade from starting while one is in flight.
@@ -189,11 +194,11 @@ struct SimpleSwapExchange {
 #[derive(Debug, Serialize)]
 struct CreateOrderRequest {
     order: PolymarketOrderStruct,
-    owner: String,        // apiKey
+    owner: String, // apiKey
     #[serde(rename = "orderType")]
-    order_type: String,   // "GTC"
+    order_type: String, // "GTC"
     #[serde(rename = "deferExec")]
-    defer_exec: bool,     // false = execute immediately
+    defer_exec: bool, // false = execute immediately
 }
 
 // USDC.e (bridged USDC) on Polygon — used by Polymarket's CTF as collateral
@@ -214,13 +219,27 @@ const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if let Err(err) = run().await {
+        let log = format!("{:#}", &err);
+        eprintln!("FATAL ERROR: {log}");
+        let alert = format!("FATAL ERROR:\n```\n{log}\n```");
+        if let Err(alert_err) = send_error_alert(&alert).await {
+            eprintln!("Failed to alert fatal error: {alert_err:#}");
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+async fn run() -> Result<()> {
     dotenvy::dotenv().ok();
     fs::create_dir_all(DATA_DIR).context("create data dir")?;
 
     // Reads PRIVATE_KEY from the .env file (loaded above via dotenvy::dotenv()).
     // Never hardcode this value — keep it in .env and add .env to .gitignore.
-    let private_key = env::var(PRIVATE_KEY_ENV)
-        .with_context(|| format!("Missing env var '{PRIVATE_KEY_ENV}' — add it to your .env file"))?;
+    let private_key = env::var(PRIVATE_KEY_ENV).with_context(|| {
+        format!("Missing env var '{PRIVATE_KEY_ENV}' — add it to your .env file")
+    })?;
     if private_key.trim().is_empty() {
         return Err(anyhow!("'{PRIVATE_KEY_ENV}' is set but empty in .env"));
     }
@@ -228,18 +247,26 @@ async fn main() -> Result<()> {
     let client = Client::new();
 
     // Parse the raw wallet so we can use it for L1 auth signing
-    let wallet_signer = private_key.trim().parse::<LocalWallet>()
+    let wallet_signer = private_key
+        .trim()
+        .parse::<LocalWallet>()
         .context("parse private key")?;
     let address = wallet_signer.address();
     eprintln!("Wallet: {:#x}", address);
 
     let creds = get_or_create_api_creds(&wallet_signer, address, &client).await?;
 
-    let wallet = Arc::new(TradingWallet { wallet: wallet_signer, address, creds });
+    let wallet = Arc::new(TradingWallet {
+        wallet: wallet_signer,
+        address,
+        creds,
+    });
 
-    ensure_allowance(&client, &wallet, CTF_EXCHANGE_ADDRESS).await
+    ensure_allowance(&client, &wallet, CTF_EXCHANGE_ADDRESS)
+        .await
         .context("ensure USDC allowance")?;
-    check_and_top_up_pol(&client, &wallet).await
+    check_and_top_up_pol(&client, &wallet)
+        .await
         .unwrap_or_else(|e| eprintln!("POL top-up check failed: {e:#}"));
     redeem_prior_windows(&client, &private_key).await;
 
@@ -265,7 +292,10 @@ async fn main() -> Result<()> {
             Err(_) => "N/A".to_string(),
         };
         let now_utc = {
-            let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            let secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
             let h = (secs % 86400) / 3600;
             let m = (secs % 3600) / 60;
             let s = secs % 60;
@@ -302,7 +332,7 @@ async fn main() -> Result<()> {
     }));
 
     // Background task: refresh fee rate every second without blocking the main loop
-    let fee_task_state  = Arc::clone(&state);
+    let fee_task_state = Arc::clone(&state);
     let fee_task_client = client.clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -343,7 +373,13 @@ async fn main() -> Result<()> {
         ticker.tick().await; // first tick fires immediately, skip it
         loop {
             ticker.tick().await;
-            if let Err(e) = ensure_allowance(&allowance_task_client, &*allowance_task_wallet, CTF_EXCHANGE_ADDRESS).await {
+            if let Err(e) = ensure_allowance(
+                &allowance_task_client,
+                &*allowance_task_wallet,
+                CTF_EXCHANGE_ADDRESS,
+            )
+            .await
+            {
                 eprintln!("WARN: periodic allowance check failed: {e:#}");
             }
         }
@@ -501,7 +537,11 @@ async fn main() -> Result<()> {
                         if let Ok(bal) = get_balance(&client, &wallet.address).await {
                             let bal_before = money.lock().await.balance_at_window_start;
                             let profit = bal - bal_before;
-                            let profit_str = format!("{}{:.4}", if profit >= 0.0 { "+$" } else { "-$" }, profit.abs());
+                            let profit_str = format!(
+                                "{}{:.4}",
+                                if profit >= 0.0 { "+$" } else { "-$" },
+                                profit.abs()
+                            );
                             let color = if profit >= 0.0 { 0x2ECC71 } else { 0xE74C3C };
                             let embed = json!({
                                 "title": "Positions Redeemed",
@@ -520,7 +560,8 @@ async fn main() -> Result<()> {
                     }
 
                     // Refill POL if running low
-                    check_and_top_up_pol(&client, &wallet).await
+                    check_and_top_up_pol(&client, &wallet)
+                        .await
                         .unwrap_or_else(|e| eprintln!("WARN: POL top-up check failed: {e:#}"));
                 }
             }
@@ -558,16 +599,13 @@ async fn discover_active_btc_5m_market(client: &Client) -> Result<MarketInfo> {
 
     let data: Value = resp.json().await.context("parse market response")?;
 
-    let market = data
-        .as_array()
-        .and_then(|arr| arr.first())
-        .ok_or_else(|| {
-            anyhow!(
-                "Market not found for slug '{slug}'. \
+    let market = data.as_array().and_then(|arr| arr.first()).ok_or_else(|| {
+        anyhow!(
+            "Market not found for slug '{slug}'. \
                  It may not be listed yet — wait a few seconds and retry. \
                  Verify at: https://polymarket.com/event/{slug}"
-            )
-        })?;
+        )
+    })?;
 
     let mut info = parse_market_info(market)?;
     info.slug = slug;
@@ -582,10 +620,8 @@ fn parse_market_info(market: &Value) -> Result<MarketInfo> {
         .ok_or_else(|| anyhow!("missing conditionId"))?
         .to_string();
 
-    let asset_ids = parse_string_array(market.get("clobTokenIds"))
-        .context("parse clobTokenIds")?;
-    let outcomes = parse_string_array(market.get("outcomes"))
-        .context("parse outcomes")?;
+    let asset_ids = parse_string_array(market.get("clobTokenIds")).context("parse clobTokenIds")?;
+    let outcomes = parse_string_array(market.get("outcomes")).context("parse outcomes")?;
 
     if asset_ids.is_empty() || outcomes.is_empty() {
         return Err(anyhow!("empty outcomes or token ids"));
@@ -633,7 +669,9 @@ async fn run_socket(
     wallet: Arc<TradingWallet>,
     asset_ids: &[String],
 ) -> Result<()> {
-    let (ws_stream, _) = connect_async(CLOB_WS_URL).await.context("connect clob ws")?;
+    let (ws_stream, _) = connect_async(CLOB_WS_URL)
+        .await
+        .context("connect clob ws")?;
     let (mut write, mut read) = ws_stream.split();
     let subscribe_msg = json!({
         "type": "market",
@@ -743,7 +781,8 @@ async fn handle_clob_message_single(
                 if let Some(changes) = changes {
                     for change in changes {
                         if let Some((asset_id, price)) = parse_price_change(change, root_asset) {
-                            update_outcome_price(state, money, wallet, &asset_id, price, ts).await?;
+                            update_outcome_price(state, money, wallet, &asset_id, price, ts)
+                                .await?;
                         }
                     }
                 }
@@ -927,7 +966,7 @@ async fn print_up_down(
         // Round to tick size FIRST, then check profitability.
         // Raw prices may look profitable but round up past 100 cents.
         // e.g. up=0.475 -> 0.48, down=0.525 -> 0.53 => sum=101 cents => loss.
-        let up   = (up   * 100.0).round() / 100.0;
+        let up = (up * 100.0).round() / 100.0;
         let down = (down * 100.0).round() / 100.0;
         let sum_cents = (up + down) * 100.0;
 
@@ -950,11 +989,15 @@ async fn print_up_down(
             // ── Trade lock gate ──────────────────────────────────────
             // Prevents a second trade from starting while one is in flight.
             // compare_exchange: only proceed if currently false (idle).
-            if TRADE_IN_PROGRESS.compare_exchange(
-                false, true,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            ).is_err() {
+            if TRADE_IN_PROGRESS
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_err()
+            {
                 eprintln!("Trade already in progress — skipping this opportunity");
                 return Ok(());
             }
@@ -962,7 +1005,16 @@ async fn print_up_down(
             LAST_DETECTION_MS.store(now, Ordering::Relaxed);
 
             // Ensure the lock is always released, even on early returns/panics.
-            let trade_result = execute_arbitrage_trade(wallet, &up_asset, &down_asset, up, down, sum_cents, fee_bps).await;
+            let trade_result = execute_arbitrage_trade(
+                wallet,
+                &up_asset,
+                &down_asset,
+                up,
+                down,
+                sum_cents,
+                fee_bps,
+            )
+            .await;
 
             // Update cooldown AFTER trade completes so the 5s window starts from trade end.
             LAST_DETECTION_MS.store(now_ms(), Ordering::Relaxed);
@@ -976,7 +1028,11 @@ async fn print_up_down(
                     money.total_shares_bought += (trade_result.shares_bought * 2) as i64;
 
                     let edge = 100.0 - sum_cents;
-                    let retry_note = if details.down_retried { " (retried)" } else { "" };
+                    let retry_note = if details.down_retried {
+                        " (retried)"
+                    } else {
+                        ""
+                    };
                     let embed = json!({
                         "title": "Trade Executed",
                         "color": 0x2ECC71,
@@ -1003,7 +1059,17 @@ async fn print_up_down(
                     }
                 }
                 Err(e) => {
-                    eprintln!("TRADE FAILED: {:#}", e);
+                    let log = format!("{:#}", e);
+                    eprintln!("TRADE FAILED: {log}");
+                    if !is_insufficient_balance_error(&e) {
+                        let alert = format!(
+                            "Trade failed (assets {}/{} | sum {:.2}c):\n```\n{}\n```",
+                            up_asset, down_asset, sum_cents, log
+                        );
+                        if let Err(alert_err) = send_error_alert(&alert).await {
+                            eprintln!("Failed to send trade failure alert: {alert_err:#}");
+                        }
+                    }
                 }
             }
         }
@@ -1013,6 +1079,28 @@ async fn print_up_down(
 }
 
 const MIN_BALANCE_USDC: f64 = 5.0;
+
+#[derive(Debug)]
+struct InsufficientBalanceError {
+    balance: f64,
+    required: f64,
+}
+
+impl fmt::Display for InsufficientBalanceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Balance ${:.2} < ${:.2} minimum",
+            self.balance, self.required
+        )
+    }
+}
+
+impl std::error::Error for InsufficientBalanceError {}
+
+fn is_insufficient_balance_error(err: &Error) -> bool {
+    err.downcast_ref::<InsufficientBalanceError>().is_some()
+}
 
 #[derive(Debug)]
 struct TradeResult {
@@ -1051,10 +1139,15 @@ async fn execute_arbitrage_trade(
     let client = Client::new();
 
     // ── Check balance ────────────────────────────────────────────────────
-    let balance = get_balance(&client, &wallet.address).await
+    let balance = get_balance(&client, &wallet.address)
+        .await
         .context("balance check before trade")?;
     if balance < MIN_BALANCE_USDC {
-        return Err(anyhow!("Balance ${:.2} < ${:.2} minimum", balance, MIN_BALANCE_USDC));
+        return Err(InsufficientBalanceError {
+            balance,
+            required: MIN_BALANCE_USDC,
+        }
+        .into());
     }
 
     // ── Order book depth ─────────────────────────────────────────────────
@@ -1072,7 +1165,11 @@ async fn execute_arbitrage_trade(
     if buy_shares < MIN_SHARES {
         return Err(anyhow!(
             "Only {} shares possible (min {}). liquidity={:.0}, affordable={:.0}, balance=${:.2}",
-            buy_shares, MIN_SHARES, liquidity_shares, affordable_shares, balance
+            buy_shares,
+            MIN_SHARES,
+            liquidity_shares,
+            affordable_shares,
+            balance
         ));
     }
 
@@ -1082,8 +1179,18 @@ async fn execute_arbitrage_trade(
     //  ORDER 1: UP
     // ═══════════════════════════════════════════════════════════════════════
     let up_salt = now_ms() as u64;
-    let up_order = build_order_request(wallet, up_asset_id, buy_shares, up_price, "BUY", fee_bps, up_salt).await?;
-    let up_res = place_single_order(&client, wallet, up_order).await
+    let up_order = build_order_request(
+        wallet,
+        up_asset_id,
+        buy_shares,
+        up_price,
+        "BUY",
+        fee_bps,
+        up_salt,
+    )
+    .await?;
+    let up_res = place_single_order(&client, wallet, up_order)
+        .await
         .context("UP order request failed")?;
 
     if !up_res.success {
@@ -1095,33 +1202,53 @@ async fn execute_arbitrage_trade(
         let _ = cancel_order(&client, wallet, &up_res.order_id).await;
         return Err(anyhow!(
             "UP order not fully filled (status={}). Cancelled {}.",
-            up_res.status, up_res.order_id
+            up_res.status,
+            up_res.order_id
         ));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
     //  Re-fetch fee rate before second order
     // ═══════════════════════════════════════════════════════════════════════
-    let down_fee_bps = get_fee_rate(&client, down_asset_id).await.unwrap_or(fee_bps);
+    let down_fee_bps = get_fee_rate(&client, down_asset_id)
+        .await
+        .unwrap_or(fee_bps);
 
     // ═══════════════════════════════════════════════════════════════════════
     //  ORDER 2: DOWN
     // ═══════════════════════════════════════════════════════════════════════
     let down_salt = now_ms() as u64 + 1;
-    let down_order = build_order_request(wallet, down_asset_id, buy_shares, down_price, "BUY", down_fee_bps, down_salt).await?;
+    let down_order = build_order_request(
+        wallet,
+        down_asset_id,
+        buy_shares,
+        down_price,
+        "BUY",
+        down_fee_bps,
+        down_salt,
+    )
+    .await?;
     let down_res = place_single_order(&client, wallet, down_order).await;
 
     if let Ok(ref r) = down_res {
         if r.success && r.status == "MATCHED" {
             let balance_after = balance - estimated_cost;
             return Ok((
-                TradeResult { shares_bought: buy_shares, total_spent: estimated_cost },
+                TradeResult {
+                    shares_bought: buy_shares,
+                    total_spent: estimated_cost,
+                },
                 TradeDetails {
-                    balance_before: balance, balance_after,
-                    up_order_id: up_res.order_id.clone(), up_status: up_res.status.clone(),
-                    down_order_id: r.order_id.clone(), down_status: r.status.clone(),
-                    up_fee_bps: fee_bps, down_fee_bps,
-                    up_depth, down_depth,
+                    balance_before: balance,
+                    balance_after,
+                    up_order_id: up_res.order_id.clone(),
+                    up_status: up_res.status.clone(),
+                    down_order_id: r.order_id.clone(),
+                    down_status: r.status.clone(),
+                    up_fee_bps: fee_bps,
+                    down_fee_bps,
+                    up_depth,
+                    down_depth,
                     down_retried: false,
                 },
             ));
@@ -1136,22 +1263,41 @@ async fn execute_arbitrage_trade(
     eprintln!("DOWN failed: {} | Retrying in 150ms...", down_err_1);
     tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
 
-    let retry_fee = get_fee_rate(&client, down_asset_id).await.unwrap_or(down_fee_bps);
+    let retry_fee = get_fee_rate(&client, down_asset_id)
+        .await
+        .unwrap_or(down_fee_bps);
     let retry_salt = now_ms() as u64 + 50;
-    let down_retry_order = build_order_request(wallet, down_asset_id, buy_shares, down_price, "BUY", retry_fee, retry_salt).await?;
+    let down_retry_order = build_order_request(
+        wallet,
+        down_asset_id,
+        buy_shares,
+        down_price,
+        "BUY",
+        retry_fee,
+        retry_salt,
+    )
+    .await?;
     let down_retry_res = place_single_order(&client, wallet, down_retry_order).await;
 
     if let Ok(ref r) = down_retry_res {
         if r.success && r.status == "MATCHED" {
             let balance_after = balance - estimated_cost;
             return Ok((
-                TradeResult { shares_bought: buy_shares, total_spent: estimated_cost },
+                TradeResult {
+                    shares_bought: buy_shares,
+                    total_spent: estimated_cost,
+                },
                 TradeDetails {
-                    balance_before: balance, balance_after,
-                    up_order_id: up_res.order_id.clone(), up_status: up_res.status.clone(),
-                    down_order_id: r.order_id.clone(), down_status: r.status.clone(),
-                    up_fee_bps: fee_bps, down_fee_bps: retry_fee,
-                    up_depth, down_depth,
+                    balance_before: balance,
+                    balance_after,
+                    up_order_id: up_res.order_id.clone(),
+                    up_status: up_res.status.clone(),
+                    down_order_id: r.order_id.clone(),
+                    down_status: r.status.clone(),
+                    up_fee_bps: fee_bps,
+                    down_fee_bps: retry_fee,
+                    up_depth,
+                    down_depth,
                     down_retried: true,
                 },
             ));
@@ -1171,9 +1317,7 @@ async fn execute_arbitrage_trade(
     );
 
     // Fetch the current UP order book so we can sell into the bids.
-    let sell_result = sell_back_shares(
-        &client, wallet, up_asset_id, buy_shares, fee_bps,
-    ).await;
+    let sell_result = sell_back_shares(&client, wallet, up_asset_id, buy_shares, fee_bps).await;
 
     match sell_result {
         Ok(sell_order_id) => {
@@ -1209,7 +1353,8 @@ async fn sell_back_shares(
     fee_bps: u64,
 ) -> Result<String> {
     // Get current order book to find best bid
-    let book = get_order_book(client, asset_id).await
+    let book = get_order_book(client, asset_id)
+        .await
         .context("fetch order book for sell-back")?;
 
     if book.bids.is_empty() {
@@ -1217,23 +1362,28 @@ async fn sell_back_shares(
     }
 
     // Use the best bid price minus slippage to ensure we fill
-    let best_bid: f64 = book.bids[0].price.parse()
-        .context("parse best bid price")?;
+    let best_bid: f64 = book.bids[0].price.parse().context("parse best bid price")?;
     let sell_price = ((best_bid - SLIPPAGE_TOLERANCE) * 100.0).round() / 100.0;
     let sell_price = sell_price.max(0.01); // floor at 1 cent
 
     eprintln!(
         "Sell-back: {} shares of {} at {:.2}c (best bid {:.2}c, slippage {}%)",
-        shares, asset_id, sell_price * 100.0, best_bid * 100.0, SLIPPAGE_TOLERANCE * 100.0
+        shares,
+        asset_id,
+        sell_price * 100.0,
+        best_bid * 100.0,
+        SLIPPAGE_TOLERANCE * 100.0
     );
 
     let sell_fee = get_fee_rate(client, asset_id).await.unwrap_or(fee_bps);
     let salt = now_ms() as u64 + 100;
-    let sell_order = build_order_request(
-        wallet, asset_id, shares, sell_price, "SELL", sell_fee, salt,
-    ).await.context("build sell-back order")?;
+    let sell_order =
+        build_order_request(wallet, asset_id, shares, sell_price, "SELL", sell_fee, salt)
+            .await
+            .context("build sell-back order")?;
 
-    let res = place_single_order(client, wallet, sell_order).await
+    let res = place_single_order(client, wallet, sell_order)
+        .await
         .context("place sell-back order")?;
 
     if res.success && res.status == "MATCHED" {
@@ -1243,7 +1393,8 @@ async fn sell_back_shares(
         let _ = cancel_order(client, wallet, &res.order_id).await;
         Err(anyhow!(
             "Sell-back order {} not filled (status={}), cancelled. Shares may still be held.",
-            res.order_id, res.status
+            res.order_id,
+            res.status
         ))
     } else {
         Err(anyhow!("Sell-back rejected: {}", res.error_msg))
@@ -1252,15 +1403,11 @@ async fn sell_back_shares(
 
 async fn get_fee_rate(client: &Client, token_id: &str) -> Result<u64> {
     let url = format!("{CLOB_API}/markets/fee-rate?token_id={token_id}");
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .context("fetch fee rate")?;
+    let resp = client.get(&url).send().await.context("fetch fee rate")?;
 
     let raw = resp.text().await.context("read fee rate response")?;
-    let parsed: Value = serde_json::from_str(&raw)
-        .with_context(|| format!("parse fee rate JSON: {raw}"))?;
+    let parsed: Value =
+        serde_json::from_str(&raw).with_context(|| format!("parse fee rate JSON: {raw}"))?;
 
     let fee = parsed
         .get("base_fee")
@@ -1272,11 +1419,7 @@ async fn get_fee_rate(client: &Client, token_id: &str) -> Result<u64> {
 
 async fn get_order_book(client: &Client, token_id: &str) -> Result<OrderBook> {
     let url = format!("{CLOB_API}/book?token_id={}", token_id);
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .context("fetch order book")?;
+    let resp = client.get(&url).send().await.context("fetch order book")?;
 
     let book: OrderBook = resp.json().await.context("parse order book")?;
     Ok(book)
@@ -1304,10 +1447,7 @@ fn calculate_total_size(levels: &[OrderBookLevel]) -> Result<f64> {
 // the ConditionalTokens contract.  We use the polymarket-client-sdk CtfClient
 // which handles ABI encoding, tx signing, and confirmation internally.
 // Called at startup (sweep old windows) and after every window close.
-async fn redeem_positions(
-    private_key: &str,
-    condition_id_hex: &str,
-) -> Result<()> {
+async fn redeem_positions(private_key: &str, condition_id_hex: &str) -> Result<()> {
     let ankr_key = env::var(ANKR_API_KEY_ENV)
         .with_context(|| format!("Missing env var '{ANKR_API_KEY_ENV}'"))?;
     let rpc_url = format!("https://rpc.ankr.com/polygon/{}", ankr_key.trim());
@@ -1386,15 +1526,15 @@ async fn redeem_prior_windows(client: &Client, private_key: &str) -> u32 {
         }
     }
 
-
     redeemed
 }
 
 async fn get_balance(client: &Client, address: &Address) -> Result<f64> {
     // Call USDC balanceOf(address) via raw eth_call on Ankr's Polygon RPC.
     // Reads ANKR_API_KEY from the .env file.
-    let ankr_key = env::var(ANKR_API_KEY_ENV)
-        .with_context(|| format!("Missing env var '{ANKR_API_KEY_ENV}' — add it to your .env file"))?;
+    let ankr_key = env::var(ANKR_API_KEY_ENV).with_context(|| {
+        format!("Missing env var '{ANKR_API_KEY_ENV}' — add it to your .env file")
+    })?;
     let ankr_key = ankr_key.trim().to_string();
     let rpc_url = format!("https://rpc.ankr.com/polygon/{}", ankr_key);
 
@@ -1420,8 +1560,8 @@ async fn get_balance(client: &Client, address: &Address) -> Result<f64> {
         .context("eth_call request failed")?;
 
     let raw = resp.text().await.context("read eth_call response")?;
-    let parsed: Value = serde_json::from_str(&raw)
-        .with_context(|| format!("parse eth_call JSON: {raw}"))?;
+    let parsed: Value =
+        serde_json::from_str(&raw).with_context(|| format!("parse eth_call JSON: {raw}"))?;
 
     if let Some(err) = parsed.get("error") {
         return Err(anyhow!("eth_call RPC error: {err}"));
@@ -1447,7 +1587,7 @@ async fn get_allowance(client: &Client, owner: &Address, spender: &str) -> Resul
         .with_context(|| format!("Missing env var '{ANKR_API_KEY_ENV}'"))?;
     let rpc_url = format!("https://rpc.ankr.com/polygon/{}", ankr_key.trim());
 
-    let owner_hex   = format!("{:x}", owner);
+    let owner_hex = format!("{:x}", owner);
     let spender_hex = spender.trim_start_matches("0x");
     // ABI-encode two addresses: each padded to 32 bytes
     let calldata = format!("0xdd62ed3e{:0>64}{:0>64}", owner_hex, spender_hex);
@@ -1459,17 +1599,24 @@ async fn get_allowance(client: &Client, owner: &Address, spender: &str) -> Resul
         "id": 1
     });
 
-    let resp = client.post(&rpc_url).json(&body).send().await
+    let resp = client
+        .post(&rpc_url)
+        .json(&body)
+        .send()
+        .await
         .context("eth_call allowance")?;
     let raw = resp.text().await.context("read allowance response")?;
-    let parsed: Value = serde_json::from_str(&raw)
-        .with_context(|| format!("parse allowance JSON: {raw}"))?;
+    let parsed: Value =
+        serde_json::from_str(&raw).with_context(|| format!("parse allowance JSON: {raw}"))?;
 
     if let Some(err) = parsed.get("error") {
         return Err(anyhow!("allowance eth_call error: {err}"));
     }
 
-    let hex = parsed.get("result").and_then(|v| v.as_str()).unwrap_or("0x0")
+    let hex = parsed
+        .get("result")
+        .and_then(|v| v.as_str())
+        .unwrap_or("0x0")
         .trim_start_matches("0x");
     let raw_amount = u128::from_str_radix(hex, 16).unwrap_or(0);
     Ok(raw_amount as f64 / 1_000_000.0)
@@ -1477,11 +1624,7 @@ async fn get_allowance(client: &Client, owner: &Address, spender: &str) -> Resul
 
 // Sends an ERC-20 approve(spender, uint256::MAX) tx via eth_sendRawTransaction.
 // Uses the wallet's private key to sign the transaction on-chain.
-async fn ensure_allowance(
-    client: &Client,
-    wallet: &TradingWallet,
-    spender: &str,
-) -> Result<()> {
+async fn ensure_allowance(client: &Client, wallet: &TradingWallet, spender: &str) -> Result<()> {
     let allowance = get_allowance(client, &wallet.address, spender).await?;
     if allowance >= 1000.0 {
         return Ok(());
@@ -1496,17 +1639,33 @@ async fn ensure_allowance(
         "jsonrpc": "2.0", "method": "eth_getTransactionCount",
         "params": [format!("{:#x}", wallet.address), "latest"], "id": 1
     });
-    let nonce_resp: Value = client.post(&rpc_url).json(&nonce_body).send().await
-        .context("get nonce")?.json().await.context("parse nonce")?;
-    let nonce = nonce_resp["result"].as_str()
+    let nonce_resp: Value = client
+        .post(&rpc_url)
+        .json(&nonce_body)
+        .send()
+        .await
+        .context("get nonce")?
+        .json()
+        .await
+        .context("parse nonce")?;
+    let nonce = nonce_resp["result"]
+        .as_str()
         .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
         .ok_or_else(|| anyhow!("could not parse nonce: {nonce_resp}"))?;
 
     // Get gas price
     let gas_body = json!({"jsonrpc":"2.0","method":"eth_gasPrice","params":[],"id":1});
-    let gas_resp: Value = client.post(&rpc_url).json(&gas_body).send().await
-        .context("get gas price")?.json().await.context("parse gas price")?;
-    let gas_price = gas_resp["result"].as_str()
+    let gas_resp: Value = client
+        .post(&rpc_url)
+        .json(&gas_body)
+        .send()
+        .await
+        .context("get gas price")?
+        .json()
+        .await
+        .context("parse gas price")?;
+    let gas_price = gas_resp["result"]
+        .as_str()
         .and_then(|s| u128::from_str_radix(s.trim_start_matches("0x"), 16).ok())
         .ok_or_else(|| anyhow!("could not parse gas price: {gas_resp}"))?;
 
@@ -1519,19 +1678,21 @@ async fn ensure_allowance(
     // Build TypedTransaction (Legacy) so we can call tx.rlp_signed()
     use ethers::types::transaction::eip2718::TypedTransaction;
     let mut tx = TypedTransaction::Legacy(ethers::types::TransactionRequest {
-        from:      Some(wallet.address),
-        to:        Some(USDC_E_POLYGON.parse::<Address>().unwrap().into()),
-        nonce:     Some(U256::from(nonce)),
-        gas:       Some(U256::from(100_000u64)),
+        from: Some(wallet.address),
+        to: Some(USDC_E_POLYGON.parse::<Address>().unwrap().into()),
+        nonce: Some(U256::from(nonce)),
+        gas: Some(U256::from(100_000u64)),
         gas_price: Some(U256::from(gas_price * 3)), // 3x = high priority for fast inclusion
-        data:      Some(calldata_bytes.into()),
-        value:     Some(U256::zero()),
-        chain_id:  Some(U64::from(CHAIN_ID)),
+        data: Some(calldata_bytes.into()),
+        value: Some(U256::zero()),
+        chain_id: Some(U64::from(CHAIN_ID)),
         ..Default::default()
     });
 
     // sign_transaction fills in the chain_id and returns the Signature
-    let sig = wallet.wallet.sign_transaction(&tx)
+    let sig = wallet
+        .wallet
+        .sign_transaction(&tx)
         .await
         .map_err(|e| anyhow!("sign approve tx: {e}"))?;
 
@@ -1542,16 +1703,23 @@ async fn ensure_allowance(
         "jsonrpc": "2.0", "method": "eth_sendRawTransaction",
         "params": [raw_tx], "id": 1
     });
-    let send_resp: Value = client.post(&rpc_url).json(&send_body).send().await
-        .context("send approve tx")?.json().await.context("parse send response")?;
+    let send_resp: Value = client
+        .post(&rpc_url)
+        .json(&send_body)
+        .send()
+        .await
+        .context("send approve tx")?
+        .json()
+        .await
+        .context("parse send response")?;
 
     if let Some(err) = send_resp.get("error") {
         return Err(anyhow!("approve tx failed: {err}"));
     }
 
-    let tx_hash = send_resp["result"].as_str()
+    let tx_hash = send_resp["result"]
+        .as_str()
         .ok_or_else(|| anyhow!("no tx hash in response: {send_resp}"))?;
-
 
     // Poll for receipt (up to 30 seconds)
     for _ in 0..30 {
@@ -1560,26 +1728,42 @@ async fn ensure_allowance(
             "jsonrpc": "2.0", "method": "eth_getTransactionReceipt",
             "params": [tx_hash], "id": 1
         });
-        let receipt: Value = client.post(&rpc_url).json(&receipt_body).send().await
-            .context("get receipt")?.json().await.context("parse receipt")?;
+        let receipt: Value = client
+            .post(&rpc_url)
+            .json(&receipt_body)
+            .send()
+            .await
+            .context("get receipt")?
+            .json()
+            .await
+            .context("parse receipt")?;
         if let Some(r) = receipt.get("result").filter(|v| !v.is_null()) {
             let status = r["status"].as_str().unwrap_or("0x0");
             if status == "0x1" {
                 return Ok(());
             } else {
-                return Err(anyhow!("Approve tx reverted. Check wallet has MATIC for gas."));
+                return Err(anyhow!(
+                    "Approve tx reverted. Check wallet has MATIC for gas."
+                ));
             }
         }
     }
 
-    Err(anyhow!("Approve tx not confirmed within 30s. Check Polygonscan: {tx_hash}"))
+    Err(anyhow!(
+        "Approve tx not confirmed within 30s. Check Polygonscan: {tx_hash}"
+    ))
 }
 
 // ── L1 EIP-712 Auth ─────────────────────────────────────────────────────────
 //
 // Signs the ClobAuth struct using ethers-rs TypedData — matches the official
 // TypeScript client exactly (same domain, same field encoding).
-async fn l1_auth_signature(wallet: &LocalWallet, address: Address, timestamp: i64, nonce: u64) -> Result<String> {
+async fn l1_auth_signature(
+    wallet: &LocalWallet,
+    address: Address,
+    timestamp: i64,
+    nonce: u64,
+) -> Result<String> {
     use ethers::types::transaction::eip712::TypedData;
 
     let typed_data: TypedData = serde_json::from_value(json!({
@@ -1608,9 +1792,12 @@ async fn l1_auth_signature(wallet: &LocalWallet, address: Address, timestamp: i6
             "nonce":     nonce,
             "message":   "This message attests that I control the given wallet"
         }
-    })).context("build ClobAuth TypedData")?;
+    }))
+    .context("build ClobAuth TypedData")?;
 
-    let sig = wallet.sign_typed_data(&typed_data).await
+    let sig = wallet
+        .sign_typed_data(&typed_data)
+        .await
         .map_err(|e| anyhow!("sign_typed_data (L1 ClobAuth) failed: {e}"))?;
 
     Ok(format!("0x{}", hex::encode(sig.to_vec())))
@@ -1620,9 +1807,17 @@ async fn l1_auth_signature(wallet: &LocalWallet, address: Address, timestamp: i6
 //
 // Produces the POLY_SIGNATURE header for authenticated CLOB API calls.
 // message = timestamp + METHOD + path + body
-fn l2_signature(secret: &str, timestamp: i64, method: &str, path: &str, body: &str) -> Result<String> {
+fn l2_signature(
+    secret: &str,
+    timestamp: i64,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> Result<String> {
     let message = format!("{}{}{}{}", timestamp, method.to_uppercase(), path, body);
-    let secret_bytes = BASE64.decode(secret).context("decode L2 secret (not valid base64)")?;
+    let secret_bytes = BASE64
+        .decode(secret)
+        .context("decode L2 secret (not valid base64)")?;
     let mut mac = Hmac::<Sha256>::new_from_slice(&secret_bytes)
         .map_err(|e| anyhow!("HMAC key error: {e}"))?;
     mac.update(message.as_bytes());
@@ -1644,10 +1839,10 @@ async fn get_or_create_api_creds(
     // ── Step 1: try GET /derive-api-key (returns existing credentials) ──────
     let derive_resp = client
         .get(format!("{CLOB_API}/auth/derive-api-key"))
-        .header("POLY_ADDRESS",   &address_str)
+        .header("POLY_ADDRESS", &address_str)
         .header("POLY_SIGNATURE", &signature)
         .header("POLY_TIMESTAMP", timestamp.to_string())
-        .header("POLY_NONCE",     nonce.to_string())
+        .header("POLY_NONCE", nonce.to_string())
         .send()
         .await
         .context("L1 auth GET /auth/derive-api-key")?;
@@ -1662,8 +1857,8 @@ async fn get_or_create_api_creds(
         derive_parsed.get("passphrase").and_then(|v| v.as_str()),
     ) {
         return Ok(ApiCredentials {
-            api_key:    k.to_string(),
-            secret:     s.to_string(),
+            api_key: k.to_string(),
+            secret: s.to_string(),
             passphrase: p.to_string(),
         });
     }
@@ -1680,10 +1875,10 @@ async fn get_or_create_api_creds(
 
     let create_resp = client
         .post(format!("{CLOB_API}/auth/api-key"))
-        .header("POLY_ADDRESS",   &address_str)
+        .header("POLY_ADDRESS", &address_str)
         .header("POLY_SIGNATURE", &signature2)
         .header("POLY_TIMESTAMP", timestamp2.to_string())
-        .header("POLY_NONCE",     nonce.to_string())
+        .header("POLY_NONCE", nonce.to_string())
         .send()
         .await
         .context("L1 auth POST /auth/api-key")?;
@@ -1700,14 +1895,18 @@ async fn get_or_create_api_creds(
              If you see \"Could not create api key\", your wallet is not registered.
              Fix: Go to https://polymarket.com, connect wallet {address_str}, accept ToS, then restart."
         ))?;
-    let secret = create_parsed.get("secret").and_then(|v| v.as_str())
+    let secret = create_parsed
+        .get("secret")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("No secret in create response: {create_raw}"))?;
-    let passphrase = create_parsed.get("passphrase").and_then(|v| v.as_str())
+    let passphrase = create_parsed
+        .get("passphrase")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("No passphrase in create response: {create_raw}"))?;
 
     Ok(ApiCredentials {
-        api_key:    api_key.to_string(),
-        secret:     secret.to_string(),
+        api_key: api_key.to_string(),
+        secret: secret.to_string(),
         passphrase: passphrase.to_string(),
     })
 }
@@ -1771,9 +1970,12 @@ async fn eip712_order_signature(
             "side":          side,
             "signatureType": 0u8
         }
-    })).context("build Order TypedData")?;
+    }))
+    .context("build Order TypedData")?;
 
-    let sig = wallet.sign_typed_data(&typed_data).await
+    let sig = wallet
+        .sign_typed_data(&typed_data)
+        .await
         .map_err(|e| anyhow!("sign_typed_data (Order) failed: {e}"))?;
 
     Ok(format!("0x{}", hex::encode(sig.to_vec())))
@@ -1811,7 +2013,9 @@ async fn build_order_request(
         return Err(anyhow!(
             "Maker amount ${:.4} is below the $1.00 minimum (size={}, price={:.4}). \
              This leg cannot be placed — skipping trade.",
-            maker_amount as f64 / 1_000_000.0, size, price
+            maker_amount as f64 / 1_000_000.0,
+            size,
+            price
         ));
     }
 
@@ -1825,7 +2029,8 @@ async fn build_order_request(
         side_uint,
         salt,
         fee_bps,
-    ).await?;
+    )
+    .await?;
 
     let order = PolymarketOrderStruct {
         salt,
@@ -1882,26 +2087,26 @@ async fn place_single_order(
         return Err(anyhow!("Order placement failed: {}", error_text));
     }
 
-    let result: BatchOrderResult = resp.json().await
-        .context("parse single order response")?;
+    let result: BatchOrderResult = resp.json().await.context("parse single order response")?;
 
     Ok(result)
 }
-
 
 // ── Cancel an open order via the CLOB API ─────────────────────────────────────
 // Fallback when a batch submission partially succeeds: cancel the successful
 // leg so we don't hold an unbalanced position.  If the order already filled
 // the cancel will fail — the caller sends a Discord alert in that case.
-async fn cancel_order(
-    client: &Client,
-    wallet: &Arc<TradingWallet>,
-    order_id: &str,
-) -> Result<()> {
+async fn cancel_order(client: &Client, wallet: &Arc<TradingWallet>, order_id: &str) -> Result<()> {
     let timestamp = now_ms() / 1000;
     let body_str = json!({"orderID": order_id}).to_string();
-    let l2_sig = l2_signature(&wallet.creds.secret, timestamp, "DELETE", "/order", &body_str)
-        .context("compute L2 HMAC for cancel")?;
+    let l2_sig = l2_signature(
+        &wallet.creds.secret,
+        timestamp,
+        "DELETE",
+        "/order",
+        &body_str,
+    )
+    .context("compute L2 HMAC for cancel")?;
 
     let url = format!("{CLOB_API}/order");
     let resp = client
@@ -1980,13 +2185,23 @@ async fn get_pol_balance(client: &Client, address: &Address) -> Result<f64> {
         "params": [format!("{:#x}", address), "latest"],
         "id": 1
     });
-    let resp: Value = client.post(&rpc_url).json(&body).send().await
-        .context("eth_getBalance")?.json().await.context("parse eth_getBalance")?;
+    let resp: Value = client
+        .post(&rpc_url)
+        .json(&body)
+        .send()
+        .await
+        .context("eth_getBalance")?
+        .json()
+        .await
+        .context("parse eth_getBalance")?;
 
     if let Some(err) = resp.get("error") {
         return Err(anyhow!("eth_getBalance error: {err}"));
     }
-    let hex = resp["result"].as_str().unwrap_or("0x0").trim_start_matches("0x");
+    let hex = resp["result"]
+        .as_str()
+        .unwrap_or("0x0")
+        .trim_start_matches("0x");
     let raw = u128::from_str_radix(hex, 16).unwrap_or(0);
     Ok(raw as f64 / 1e18) // POL has 18 decimals
 }
@@ -2037,10 +2252,10 @@ async fn create_simpleswap_exchange(
     }
 
     Ok(SimpleSwapExchange {
-        public_id:    obj["publicId"].as_str().unwrap_or("").to_string(),
+        public_id: obj["publicId"].as_str().unwrap_or("").to_string(),
         address_from: obj["addressFrom"].as_str().unwrap_or("").to_string(),
-        amount_from:  obj["amountFrom"].as_str().unwrap_or("").to_string(),
-        status:       obj["status"].as_str().unwrap_or("").to_string(),
+        amount_from: obj["amountFrom"].as_str().unwrap_or("").to_string(),
+        status: obj["status"].as_str().unwrap_or("").to_string(),
     })
 }
 
@@ -2061,17 +2276,31 @@ async fn send_usdc_transfer(
         "jsonrpc": "2.0", "method": "eth_getTransactionCount",
         "params": [format!("{:#x}", wallet.address), "latest"], "id": 1
     });
-    let nonce_resp: Value = client.post(&rpc_url).json(&nonce_body).send().await
-        .context("get nonce for USDC transfer")?.json().await?;
-    let nonce = nonce_resp["result"].as_str()
+    let nonce_resp: Value = client
+        .post(&rpc_url)
+        .json(&nonce_body)
+        .send()
+        .await
+        .context("get nonce for USDC transfer")?
+        .json()
+        .await?;
+    let nonce = nonce_resp["result"]
+        .as_str()
         .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
         .ok_or_else(|| anyhow!("bad nonce: {nonce_resp}"))?;
 
     // Gas price
     let gas_body = json!({"jsonrpc":"2.0","method":"eth_gasPrice","params":[],"id":1});
-    let gas_resp: Value = client.post(&rpc_url).json(&gas_body).send().await
-        .context("get gas price")?.json().await?;
-    let gas_price = gas_resp["result"].as_str()
+    let gas_resp: Value = client
+        .post(&rpc_url)
+        .json(&gas_body)
+        .send()
+        .await
+        .context("get gas price")?
+        .json()
+        .await?;
+    let gas_price = gas_resp["result"]
+        .as_str()
         .and_then(|s| u128::from_str_radix(s.trim_start_matches("0x"), 16).ok())
         .ok_or_else(|| anyhow!("bad gas price: {gas_resp}"))?;
 
@@ -2083,18 +2312,21 @@ async fn send_usdc_transfer(
 
     use ethers::types::transaction::eip2718::TypedTransaction;
     let mut tx = TypedTransaction::Legacy(ethers::types::TransactionRequest {
-        from:      Some(wallet.address),
-        to:        Some(USDC_E_POLYGON.parse::<Address>().unwrap().into()),
-        nonce:     Some(U256::from(nonce)),
-        gas:       Some(U256::from(80_000u64)),
+        from: Some(wallet.address),
+        to: Some(USDC_E_POLYGON.parse::<Address>().unwrap().into()),
+        nonce: Some(U256::from(nonce)),
+        gas: Some(U256::from(80_000u64)),
         gas_price: Some(U256::from(gas_price * 3)), // 3× for fast inclusion
-        data:      Some(calldata_bytes.into()),
-        value:     Some(U256::zero()),
-        chain_id:  Some(U64::from(CHAIN_ID)),
+        data: Some(calldata_bytes.into()),
+        value: Some(U256::zero()),
+        chain_id: Some(U64::from(CHAIN_ID)),
         ..Default::default()
     });
 
-    let sig = wallet.wallet.sign_transaction(&tx).await
+    let sig = wallet
+        .wallet
+        .sign_transaction(&tx)
+        .await
         .map_err(|e| anyhow!("sign USDC transfer: {e}"))?;
     let raw_tx = format!("0x{}", hex::encode(tx.rlp_signed(&sig)));
 
@@ -2102,13 +2334,20 @@ async fn send_usdc_transfer(
         "jsonrpc": "2.0", "method": "eth_sendRawTransaction",
         "params": [raw_tx], "id": 1
     });
-    let send_resp: Value = client.post(&rpc_url).json(&send_body).send().await
-        .context("broadcast USDC transfer")?.json().await?;
+    let send_resp: Value = client
+        .post(&rpc_url)
+        .json(&send_body)
+        .send()
+        .await
+        .context("broadcast USDC transfer")?
+        .json()
+        .await?;
 
     if let Some(err) = send_resp.get("error") {
         return Err(anyhow!("USDC transfer tx failed: {err}"));
     }
-    let tx_hash = send_resp["result"].as_str()
+    let tx_hash = send_resp["result"]
+        .as_str()
         .ok_or_else(|| anyhow!("no tx hash in response: {send_resp}"))?
         .to_string();
 
@@ -2120,7 +2359,10 @@ async fn send_usdc_transfer(
 /// SimpleSwap will then forward POL to our wallet asynchronously.
 async fn check_and_top_up_pol(client: &Client, wallet: &Arc<TradingWallet>) -> Result<()> {
     // Skip silently if no API key configured
-    if env::var(SIMPLESWAP_API_KEY_ENV).map(|k| k.trim().is_empty()).unwrap_or(true) {
+    if env::var(SIMPLESWAP_API_KEY_ENV)
+        .map(|k| k.trim().is_empty())
+        .unwrap_or(true)
+    {
         return Ok(());
     }
 
@@ -2161,6 +2403,22 @@ async fn check_and_top_up_pol(client: &Client, wallet: &Arc<TradingWallet>) -> R
     Ok(())
 }
 
+async fn send_error_alert(message: &str) -> Result<()> {
+    if ERROR_DISCORD_WEBHOOK_URL.trim().is_empty() {
+        return Ok(());
+    }
+
+    let client = Client::new();
+    let payload = json!({ "content": message });
+    client
+        .post(ERROR_DISCORD_WEBHOOK_URL)
+        .json(&payload)
+        .send()
+        .await
+        .context("send error alert webhook")?;
+    Ok(())
+}
+
 async fn send_discord_webhook(message: &str) -> Result<()> {
     if DISCORD_WEBHOOK_URL.trim().is_empty() {
         return Ok(());
@@ -2192,9 +2450,6 @@ async fn send_discord_embed(embed: Value) -> Result<()> {
         .context("send discord embed")?;
     Ok(())
 }
-
-
-
 
 fn parse_timestamp(value: Option<&Value>) -> Option<i64> {
     let v = value?;
