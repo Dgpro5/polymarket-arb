@@ -49,7 +49,6 @@ const PRIVATE_KEY_ENV: &str = "PRIVATE_KEY";
 // This constant is a hard fallback only used if the fee fetch fails.
 const MIN_PROFIT_THRESHOLD_FALLBACK: f64 = 90.0;
 const SLIPPAGE_TOLERANCE: f64 = 0.02; // 2% slippage tolerance
-const FOK_PRICE_BUFFER: f64 = 0.01; // 1 cent above ask per side to absorb book shifts
 
 static LAST_DETECTION_MS: AtomicI64 = AtomicI64::new(0);
 /// Global trade lock — prevents a second trade from starting while one is in flight.
@@ -979,10 +978,7 @@ async fn print_up_down(
             MIN_PROFIT_THRESHOLD_FALLBACK
         };
 
-        // Worst-case: both sides fill at buffered price (+1c each = +2c total).
-        // We must still be profitable even after the buffer.
-        let worst_case_sum = sum_cents + (FOK_PRICE_BUFFER * 2.0 * 100.0);
-        if worst_case_sum < profit_threshold {
+        if sum_cents < profit_threshold {
             // ── Cooldown gate ────────────────────────────────────────
             let now = now_ms();
             let last = LAST_DETECTION_MS.load(Ordering::Relaxed);
@@ -1154,51 +1150,21 @@ async fn execute_arbitrage_trade(
         .into());
     }
 
-    // ── Order book depth + fresh best-ask prices ──────────────────────
+    // ── Order book depth ─────────────────────────────────────────────────
     let up_book = get_order_book(&client, up_asset_id).await?;
     let up_depth = calculate_total_size(&up_book.asks)?;
     let down_book = get_order_book(&client, down_asset_id).await?;
     let down_depth = calculate_total_size(&down_book.asks)?;
 
-    // Use the ACTUAL best (lowest) ask from the freshly fetched order book,
-    // not the stale midpoint from the WebSocket.  The midpoint can sit below
-    // the ask (e.g. bid=0.38 ask=0.42 → mid=0.40) causing FOK BUYs to fail.
-    // The asks array is NOT guaranteed to be sorted, so we find the minimum.
-    let up_best_ask: f64 = up_book
-        .asks
-        .iter()
-        .filter_map(|l| l.price.parse::<f64>().ok())
-        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .unwrap_or(up_price);
-    let down_best_ask: f64 = down_book
-        .asks
-        .iter()
-        .filter_map(|l| l.price.parse::<f64>().ok())
-        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .unwrap_or(down_price);
-
-    // Re-check profitability with real ask prices + buffer (worst case)
-    let up_buffered = up_best_ask + FOK_PRICE_BUFFER;
-    let down_buffered = down_best_ask + FOK_PRICE_BUFFER;
-    let worst_case_sum_trade = (up_buffered + down_buffered) * 100.0;
-    let trade_threshold = if fee_bps > 0 {
-        100.0 / (1.0 + fee_bps as f64 / 10000.0)
-    } else {
-        MIN_PROFIT_THRESHOLD_FALLBACK
-    };
-    if worst_case_sum_trade >= trade_threshold {
-        return Err(anyhow!(
-            "Not profitable at real ask prices: UP ask={:.2}c, DOWN ask={:.2}c, \
-             buffered sum={:.2}c >= threshold {:.2}c",
-            up_best_ask * 100.0,
-            down_best_ask * 100.0,
-            worst_case_sum_trade,
-            trade_threshold
-        ));
-    }
-
     let liquidity_shares = (up_depth.min(down_depth) * 0.8).floor();
-    let cost_per_pair = up_buffered + down_buffered;
+    // Use best-ask for initial cost estimate (refined below with fill price)
+    let up_best_ask: f64 = up_book.asks.first()
+        .and_then(|l| l.price.parse().ok())
+        .unwrap_or(up_price);
+    let down_best_ask: f64 = down_book.asks.first()
+        .and_then(|l| l.price.parse().ok())
+        .unwrap_or(down_price);
+    let cost_per_pair = up_best_ask + down_best_ask;
     let affordable_shares = ((balance - MIN_BALANCE_USDC) / cost_per_pair).floor();
     let buy_shares = liquidity_shares.min(affordable_shares) as u64;
 
@@ -1214,7 +1180,37 @@ async fn execute_arbitrage_trade(
         ));
     }
 
-    let estimated_cost = cost_per_pair * (buy_shares as f64);
+    // ── Walk the book to find the exact fill price for our share count ───
+    let up_fill_price = calculate_fill_price(&up_book.asks, buy_shares)
+        .ok_or_else(|| anyhow!(
+            "UP book too thin: need {} shares but only {:.0} available",
+            buy_shares, up_depth
+        ))?;
+    let down_fill_price = calculate_fill_price(&down_book.asks, buy_shares)
+        .ok_or_else(|| anyhow!(
+            "DOWN book too thin: need {} shares but only {:.0} available",
+            buy_shares, down_depth
+        ))?;
+
+    // Re-check profitability at the actual fill prices (worst case)
+    let fill_sum_cents = (up_fill_price + down_fill_price) * 100.0;
+    let trade_threshold = if fee_bps > 0 {
+        100.0 / (1.0 + fee_bps as f64 / 10000.0)
+    } else {
+        MIN_PROFIT_THRESHOLD_FALLBACK
+    };
+    if fill_sum_cents >= trade_threshold {
+        return Err(anyhow!(
+            "Not profitable at fill prices: UP={:.2}c, DOWN={:.2}c, \
+             sum={:.2}c >= threshold {:.2}c",
+            up_fill_price * 100.0,
+            down_fill_price * 100.0,
+            fill_sum_cents,
+            trade_threshold
+        ));
+    }
+
+    let estimated_cost = (up_fill_price + down_fill_price) * (buy_shares as f64);
 
     // ═══════════════════════════════════════════════════════════════════════
     //  ORDER 1: UP
@@ -1224,7 +1220,7 @@ async fn execute_arbitrage_trade(
         wallet,
         up_asset_id,
         buy_shares,
-        up_buffered,
+        up_fill_price,
         "BUY",
         fee_bps,
         up_salt,
@@ -1263,7 +1259,7 @@ async fn execute_arbitrage_trade(
         wallet,
         down_asset_id,
         buy_shares,
-        down_buffered,
+        down_fill_price,
         "BUY",
         down_fee_bps,
         down_salt,
@@ -1307,12 +1303,16 @@ async fn execute_arbitrage_trade(
     let retry_fee = get_fee_rate(&client, down_asset_id)
         .await
         .unwrap_or(down_fee_bps);
+    // Re-fetch the book for a fresh fill price on retry
+    let retry_down_book = get_order_book(&client, down_asset_id).await?;
+    let retry_fill_price = calculate_fill_price(&retry_down_book.asks, buy_shares)
+        .ok_or_else(|| anyhow!("DOWN book too thin on retry: need {} shares", buy_shares))?;
     let retry_salt = now_ms() as u64 + 50;
     let down_retry_order = build_order_request(
         wallet,
         down_asset_id,
         buy_shares,
-        down_buffered,
+        retry_fill_price,
         "BUY",
         retry_fee,
         retry_salt,
@@ -1480,6 +1480,23 @@ fn calculate_total_size(levels: &[OrderBookLevel]) -> Result<f64> {
         .sum();
 
     Ok(total_size)
+}
+
+/// Walk the ask side of the order book to find the worst price level needed
+/// to fill `shares` via a FOK BUY.  Asks are sorted ascending (best first).
+/// Returns `None` if the book doesn't have enough depth.
+fn calculate_fill_price(asks: &[OrderBookLevel], shares: u64) -> Option<f64> {
+    let mut remaining = shares as f64;
+
+    for level in asks {
+        let price: f64 = level.price.parse().ok()?;
+        let size: f64 = level.size.parse().ok()?;
+        remaining -= size;
+        if remaining <= 0.0 {
+            return Some(price);
+        }
+    }
+    None // not enough depth for FOK
 }
 
 // ── CTF Position Redemption (via polymarket-client-sdk) ──────────────────────
