@@ -1160,18 +1160,21 @@ async fn execute_arbitrage_trade(
     let down_book = get_order_book(&client, down_asset_id).await?;
     let down_depth = calculate_total_size(&down_book.asks)?;
 
-    // Use the ACTUAL best ask from the freshly fetched order book, not the
-    // stale midpoint from the WebSocket.  The midpoint can sit below the ask
-    // (e.g. bid=0.38 ask=0.42 → mid=0.40) causing FOK BUYs to fail.
+    // Use the ACTUAL best (lowest) ask from the freshly fetched order book,
+    // not the stale midpoint from the WebSocket.  The midpoint can sit below
+    // the ask (e.g. bid=0.38 ask=0.42 → mid=0.40) causing FOK BUYs to fail.
+    // The asks array is NOT guaranteed to be sorted, so we find the minimum.
     let up_best_ask: f64 = up_book
         .asks
-        .first()
-        .and_then(|l| l.price.parse().ok())
+        .iter()
+        .filter_map(|l| l.price.parse::<f64>().ok())
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .unwrap_or(up_price);
     let down_best_ask: f64 = down_book
         .asks
-        .first()
-        .and_then(|l| l.price.parse().ok())
+        .iter()
+        .filter_map(|l| l.price.parse::<f64>().ok())
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .unwrap_or(down_price);
 
     // Re-check profitability with real ask prices + buffer (worst case)
