@@ -49,6 +49,7 @@ const PRIVATE_KEY_ENV: &str = "PRIVATE_KEY";
 // This constant is a hard fallback only used if the fee fetch fails.
 const MIN_PROFIT_THRESHOLD_FALLBACK: f64 = 90.0;
 const SLIPPAGE_TOLERANCE: f64 = 0.02; // 2% slippage tolerance
+const FOK_PRICE_BUFFER: f64 = 0.01; // 1 cent above ask per side to absorb book shifts
 
 static LAST_DETECTION_MS: AtomicI64 = AtomicI64::new(0);
 /// Global trade lock — prevents a second trade from starting while one is in flight.
@@ -978,7 +979,10 @@ async fn print_up_down(
             MIN_PROFIT_THRESHOLD_FALLBACK
         };
 
-        if sum_cents < profit_threshold {
+        // Worst-case: both sides fill at buffered price (+1c each = +2c total).
+        // We must still be profitable even after the buffer.
+        let worst_case_sum = sum_cents + (FOK_PRICE_BUFFER * 2.0 * 100.0);
+        if worst_case_sum < profit_threshold {
             // ── Cooldown gate ────────────────────────────────────────
             let now = now_ms();
             let last = LAST_DETECTION_MS.load(Ordering::Relaxed);
@@ -1157,7 +1161,10 @@ async fn execute_arbitrage_trade(
     let down_depth = calculate_total_size(&down_book.asks)?;
 
     let liquidity_shares = (up_depth.min(down_depth) * 0.8).floor();
-    let cost_per_pair = up_price + down_price;
+    // Use buffered prices for cost estimation (worst-case spending)
+    let up_buffered = up_price + FOK_PRICE_BUFFER;
+    let down_buffered = down_price + FOK_PRICE_BUFFER;
+    let cost_per_pair = up_buffered + down_buffered;
     let affordable_shares = ((balance - MIN_BALANCE_USDC) / cost_per_pair).floor();
     let buy_shares = liquidity_shares.min(affordable_shares) as u64;
 
@@ -1183,7 +1190,7 @@ async fn execute_arbitrage_trade(
         wallet,
         up_asset_id,
         buy_shares,
-        up_price,
+        up_buffered,
         "BUY",
         fee_bps,
         up_salt,
@@ -1222,7 +1229,7 @@ async fn execute_arbitrage_trade(
         wallet,
         down_asset_id,
         buy_shares,
-        down_price,
+        down_buffered,
         "BUY",
         down_fee_bps,
         down_salt,
@@ -1271,7 +1278,7 @@ async fn execute_arbitrage_trade(
         wallet,
         down_asset_id,
         buy_shares,
-        down_price,
+        down_buffered,
         "BUY",
         retry_fee,
         retry_salt,
