@@ -34,7 +34,7 @@ const DATA_DIR: &str = "data";
 const LATEST_PATH: &str = "data/btc_updown_5m_latest.json";
 const CSV_PATH: &str = "data/btc_updown_5m_candles.csv";
 const DISCORD_WEBHOOK_URL: &str = "https://discord.com/api/webhooks/1473284259363164211/4sgTuuoGlwS4OyJ5x6-QmpPA_Q1gvsIZB9EZrb9zWX6qyA0LMQklz3IupBfINPVnpsMZ";
-const DETECTION_COOLDOWN_MS: i64 = 500;
+const DETECTION_COOLDOWN_MS: i64 = 5_000; // 5 seconds — prevent rapid sequential trades
 
 const PRIVATE_KEY_ENV: &str = "PRIVATE_KEY";
 
@@ -46,6 +46,9 @@ const MIN_PROFIT_THRESHOLD_FALLBACK: f64 = 90.0;
 const SLIPPAGE_TOLERANCE: f64 = 0.02;   // 2% slippage tolerance
 
 static LAST_DETECTION_MS: AtomicI64 = AtomicI64::new(0);
+/// Global trade lock — prevents a second trade from starting while one is in flight.
+/// `false` = idle, `true` = trade in progress.
+static TRADE_IN_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[derive(Debug, Clone)]
 struct Candle {
@@ -937,14 +940,35 @@ async fn print_up_down(
         };
 
         if sum_cents < profit_threshold {
+            // ── Cooldown gate ────────────────────────────────────────
             let now = now_ms();
             let last = LAST_DETECTION_MS.load(Ordering::Relaxed);
             if now - last < DETECTION_COOLDOWN_MS {
                 return Ok(());
             }
+
+            // ── Trade lock gate ──────────────────────────────────────
+            // Prevents a second trade from starting while one is in flight.
+            // compare_exchange: only proceed if currently false (idle).
+            if TRADE_IN_PROGRESS.compare_exchange(
+                false, true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            ).is_err() {
+                eprintln!("Trade already in progress — skipping this opportunity");
+                return Ok(());
+            }
+
             LAST_DETECTION_MS.store(now, Ordering::Relaxed);
 
-            match execute_arbitrage_trade(wallet, &up_asset, &down_asset, up, down, sum_cents, fee_bps).await {
+            // Ensure the lock is always released, even on early returns/panics.
+            let trade_result = execute_arbitrage_trade(wallet, &up_asset, &down_asset, up, down, sum_cents, fee_bps).await;
+
+            // Update cooldown AFTER trade completes so the 5s window starts from trade end.
+            LAST_DETECTION_MS.store(now_ms(), Ordering::Relaxed);
+            TRADE_IN_PROGRESS.store(false, Ordering::SeqCst);
+
+            match trade_result {
                 Ok((trade_result, details)) => {
                     let mut money = money.lock().await;
                     money.money_spent += trade_result.total_spent;
@@ -1134,26 +1158,95 @@ async fn execute_arbitrage_trade(
         }
     }
 
-    // ── DOWN failed twice — cancel UP ────────────────────────────────────
+    // ── DOWN failed twice — UP is already FILLED (FOK+MATCHED) ─────────
+    // A cancel is useless because the FOK order already executed.
+    // We must SELL the UP shares back to unwind the one-sided position.
     let down_err_2 = match &down_retry_res {
         Ok(r) => r.error_msg.clone(),
         Err(e) => format!("{:#}", e),
     };
-    eprintln!("DOWN failed twice: 1st={} | 2nd={} | Cancelling UP {}", down_err_1, down_err_2, up_res.order_id);
+    eprintln!(
+        "DOWN failed twice: 1st={} | 2nd={} | Selling back {} UP shares to unwind",
+        down_err_1, down_err_2, buy_shares
+    );
 
-    match cancel_order(&client, wallet, &up_res.order_id).await {
-        Ok(_) => {
-            Err(anyhow!("DOWN failed twice. 1st: {} | 2nd: {} | UP {} cancelled", down_err_1, down_err_2, up_res.order_id))
-        }
-        Err(e) => {
+    // Fetch the current UP order book so we can sell into the bids.
+    let sell_result = sell_back_shares(
+        &client, wallet, up_asset_id, buy_shares, fee_bps,
+    ).await;
+
+    match sell_result {
+        Ok(sell_order_id) => {
             let msg = format!(
-                "CRITICAL: UP {} placed, DOWN failed ({}), cancel failed: {:#}",
-                up_res.order_id, down_err_2, e
+                "DOWN failed twice (1st: {} | 2nd: {}). Sold {} UP shares back (order {}). No net position.",
+                down_err_1, down_err_2, buy_shares, sell_order_id
             );
             eprintln!("{}", msg);
             let _ = send_discord_webhook(&msg).await;
             Err(anyhow!("{}", msg))
         }
+        Err(sell_err) => {
+            let msg = format!(
+                "CRITICAL: UP {} filled {} shares, DOWN failed ({}), SELL-BACK ALSO FAILED: {:#}. \
+                 UNBALANCED POSITION — manual intervention required!",
+                up_res.order_id, buy_shares, down_err_2, sell_err
+            );
+            eprintln!("{}", msg);
+            let _ = send_discord_webhook(&msg).await;
+            Err(anyhow!("{}", msg))
+        }
+    }
+}
+
+/// Sell back shares that were bought on one side when the other side failed.
+/// Uses a FOK SELL order at the best bid price (with slippage tolerance)
+/// to immediately liquidate the position.
+async fn sell_back_shares(
+    client: &Client,
+    wallet: &Arc<TradingWallet>,
+    asset_id: &str,
+    shares: u64,
+    fee_bps: u64,
+) -> Result<String> {
+    // Get current order book to find best bid
+    let book = get_order_book(client, asset_id).await
+        .context("fetch order book for sell-back")?;
+
+    if book.bids.is_empty() {
+        return Err(anyhow!("No bids in order book — cannot sell back shares"));
+    }
+
+    // Use the best bid price minus slippage to ensure we fill
+    let best_bid: f64 = book.bids[0].price.parse()
+        .context("parse best bid price")?;
+    let sell_price = ((best_bid - SLIPPAGE_TOLERANCE) * 100.0).round() / 100.0;
+    let sell_price = sell_price.max(0.01); // floor at 1 cent
+
+    eprintln!(
+        "Sell-back: {} shares of {} at {:.2}c (best bid {:.2}c, slippage {}%)",
+        shares, asset_id, sell_price * 100.0, best_bid * 100.0, SLIPPAGE_TOLERANCE * 100.0
+    );
+
+    let sell_fee = get_fee_rate(client, asset_id).await.unwrap_or(fee_bps);
+    let salt = now_ms() as u64 + 100;
+    let sell_order = build_order_request(
+        wallet, asset_id, shares, sell_price, "SELL", sell_fee, salt,
+    ).await.context("build sell-back order")?;
+
+    let res = place_single_order(client, wallet, sell_order).await
+        .context("place sell-back order")?;
+
+    if res.success && res.status == "MATCHED" {
+        Ok(res.order_id)
+    } else if res.success {
+        // Order accepted but not filled — try to cancel
+        let _ = cancel_order(client, wallet, &res.order_id).await;
+        Err(anyhow!(
+            "Sell-back order {} not filled (status={}), cancelled. Shares may still be held.",
+            res.order_id, res.status
+        ))
+    } else {
+        Err(anyhow!("Sell-back rejected: {}", res.error_msg))
     }
 }
 
