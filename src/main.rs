@@ -1223,7 +1223,7 @@ async fn execute_arbitrage_trade(
     if !first_res.success {
         return Err(anyhow!("{} rejected: {}", first_label, first_res.error_msg));
     }
-    if first_res.status != "MATCHED" {
+    if !first_res.status.eq_ignore_ascii_case("MATCHED") {
         let _ = cancel_order(&client, wallet, &first_res.order_id).await;
         return Err(anyhow!(
             "{} order not fully filled (status={}). Cancelled {}.",
@@ -1245,7 +1245,7 @@ async fn execute_arbitrage_trade(
     let second_res = place_single_order(&client, wallet, second_order).await;
 
     if let Ok(ref r) = second_res {
-        if r.success && r.status == "MATCHED" {
+        if r.success && r.status.eq_ignore_ascii_case("MATCHED") {
             let balance_after = balance - estimated_cost;
             // Map first/second back to up/down for TradeDetails
             let (up_oid, up_st, down_oid, down_st, up_fee, down_fee) =
@@ -1288,7 +1288,7 @@ async fn execute_arbitrage_trade(
     let retry_res = place_single_order(&client, wallet, retry_order).await;
 
     if let Ok(ref r) = retry_res {
-        if r.success && r.status == "MATCHED" {
+        if r.success && r.status.eq_ignore_ascii_case("MATCHED") {
             let balance_after = balance - estimated_cost;
             let (up_oid, up_st, down_oid, down_st, up_fee, down_fee) =
                 if first_label == "UP" {
@@ -1390,7 +1390,7 @@ async fn sell_back_shares(
         .await
         .context("place sell-back order")?;
 
-    if res.success && res.status == "MATCHED" {
+    if res.success && res.status.eq_ignore_ascii_case("MATCHED") {
         Ok(res.order_id)
     } else if res.success {
         // Order accepted but not filled — try to cancel
