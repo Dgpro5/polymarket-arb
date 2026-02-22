@@ -1178,8 +1178,16 @@ async fn execute_arbitrage_trade(
 
     let liquidity_shares = (up_depth.min(down_depth) * 0.8).floor();
     let cost_per_pair = up_ask + down_ask;
-    let affordable_shares = ((balance - MIN_BALANCE_USDC) / cost_per_pair).floor();
-    let buy_shares = liquidity_shares.min(affordable_shares) as u64;
+    let available = balance - MIN_BALANCE_USDC;
+    let affordable_shares = (available / cost_per_pair).floor();
+    // Cap so the more expensive leg never exceeds half the available balance.
+    // This ensures we always have enough left for the second leg even with
+    // asymmetric prices (e.g. UP=56c, DOWN=15c).
+    let max_expensive_leg = up_ask.max(down_ask);
+    let half_balance_shares = (available / 2.0 / max_expensive_leg).floor();
+    let buy_shares = liquidity_shares
+        .min(affordable_shares)
+        .min(half_balance_shares) as u64;
 
     const MIN_SHARES: u64 = 5;
     if buy_shares < MIN_SHARES {
