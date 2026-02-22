@@ -100,12 +100,9 @@ struct MarketState {
 }
 
 struct MoneyManager {
-    money_spent: f64,
     total_buy_positions: i64,
     total_shares_bought: i64,
-    // Budget for the current 5-minute window
-    window_budget: f64,      // 3/4 of balance at window start — hard stop when reached
-    per_trade_limit: f64,    // 1/4 of balance at window start — max spend per trade
+    money_spent: f64,
     balance_at_window_start: f64, // snapshot for profit calculation at window close
 }
 
@@ -231,49 +228,29 @@ async fn main() -> Result<()> {
     let wallet_signer = private_key.trim().parse::<LocalWallet>()
         .context("parse private key")?;
     let address = wallet_signer.address();
-    println!("Trading wallet address: {:#x}", address);
+    eprintln!("Wallet: {:#x}", address);
 
-    // L1 auth: sign an EIP-712 message with the private key to obtain API credentials
-    notify_important("Obtaining Polymarket API credentials via L1 auth...").await?;
     let creds = get_or_create_api_creds(&wallet_signer, address, &client).await?;
-    notify_important(&format!("API credentials ready. apiKey={}", creds.api_key)).await?;
 
     let wallet = Arc::new(TradingWallet { wallet: wallet_signer, address, creds });
 
-    // Ensure the CTF Exchange has sufficient USDC allowance before trading.
-    // This is a one-time on-chain approve() call if allowance is below $1000.
-    notify_important("Checking USDC allowance for CTF Exchange...").await?;
     ensure_allowance(&client, &wallet, CTF_EXCHANGE_ADDRESS).await
         .context("ensure USDC allowance")?;
-
-    // Top up POL (gas token) if running low — uses SimpleSwap to swap USDC.e → POL
-    notify_important("Checking POL (gas) balance...").await?;
     check_and_top_up_pol(&client, &wallet).await
-        .unwrap_or_else(|e| eprintln!("WARN: POL top-up check failed: {e:#}"));
-
-    // At startup, attempt to redeem positions from recently resolved markets.
-    // Markets need time for the oracle to call reportPayouts() before redeem works,
-    // so we scan windows that ended 5+ minutes ago (not the one that just closed).
-    notify_important("Checking for redeemable CTF positions from prior windows...").await?;
+        .unwrap_or_else(|e| eprintln!("POL top-up check failed: {e:#}"));
     redeem_prior_windows(&client, &private_key).await;
 
     // Initialize money manager
     let money: Arc<Mutex<MoneyManager>> = Arc::new(Mutex::new(MoneyManager {
-        money_spent: 0.0,
         total_buy_positions: 0,
         total_shares_bought: 0,
-        window_budget: 0.0,
-        per_trade_limit: 0.0,
+        money_spent: 0.0,
         balance_at_window_start: 0.0,
     }));
 
-    // Check initial balance — non-fatal so a bad endpoint doesn't block startup
     match get_balance(&client, &wallet.address).await {
-        Ok(balance) => notify_important(&format!("Initial USDC balance: ${:.4}", balance)).await?,
-        Err(e) => {
-            eprintln!("WARN: Could not fetch initial balance: {e:#}");
-            eprintln!("WARN: Bot will still run — balance is re-checked before each trade.");
-        }
+        Ok(balance) => eprintln!("Balance: ${:.4}", balance),
+        Err(e) => eprintln!("Could not fetch initial balance: {e:#}"),
     }
 
     let market = discover_active_btc_5m_market(&client).await?;
@@ -303,7 +280,6 @@ async fn main() -> Result<()> {
             ],
             "footer": { "text": "Polymarket Arbitrage Bot" }
         });
-        println!("Active market: https://polymarket.com/event/{}", market.slug);
         if let Err(e) = send_discord_embed(embed).await {
             eprintln!("Discord startup embed failed: {e:#}");
         }
@@ -340,14 +316,7 @@ async fn main() -> Result<()> {
                 match get_fee_rate(&fee_task_client, &token_id).await {
                     Ok(new_fee) => {
                         let mut guard = fee_task_state.lock().await;
-                        if guard.fee_bps != new_fee {
-                            let break_even = 100.0 / (1.0 + new_fee as f64 / 10000.0);
-                            println!(
-                                "Fee rate updated: {} -> {} bps. New profit threshold: {:.2}",
-                                guard.fee_bps, new_fee, break_even
-                            );
-                            guard.fee_bps = new_fee;
-                        }
+                        guard.fee_bps = new_fee;
                     }
                     Err(e) => {
                         // "market not found" is normal during window transitions —
@@ -363,43 +332,16 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Background task: refresh balance every 5 minutes and recalculate budget.
-    // When money returns to the wallet (cancelled orders, redeemed positions),
-    // the MoneyManager's tracked budget goes stale. This periodic refresh
-    // recalculates from the actual on-chain balance so we don't stop trading
-    // while sitting on available funds.
-    let balance_task_money   = Arc::clone(&money);
-    let balance_task_wallet  = Arc::clone(&wallet);
-    let balance_task_client  = client.clone();
+    // Background task: refresh USDC allowance every 5 minutes.
+    let allowance_task_wallet = Arc::clone(&wallet);
+    let allowance_task_client = client.clone();
     tokio::spawn(async move {
-        // 5 minutes — matches the window duration
         let mut ticker = tokio::time::interval(Duration::from_secs(5 * 60));
         ticker.tick().await; // first tick fires immediately, skip it
         loop {
             ticker.tick().await;
-            match get_balance(&balance_task_client, &balance_task_wallet.address).await {
-                Ok(balance) => {
-                    let mut m = balance_task_money.lock().await;
-                    let old_budget = m.window_budget;
-                    let old_spent  = m.money_spent;
-                    // Recalculate budget from actual balance
-                    m.balance_at_window_start = balance;
-                    m.window_budget = balance * 0.75;
-                    m.per_trade_limit = balance * 0.25;
-                    m.money_spent = 0.0; // reset — budget is now based on fresh balance
-                    println!(
-                        "Balance refresh: ${:.4} (was budget=${:.4}, spent=${:.4}). New budget=${:.4}, per_trade=${:.4}",
-                        balance, old_budget, old_spent, m.window_budget, m.per_trade_limit
-                    );
-
-                    // Also verify USDC allowance is still sufficient
-                    if let Err(e) = ensure_allowance(&balance_task_client, &*balance_task_wallet, CTF_EXCHANGE_ADDRESS).await {
-                        eprintln!("WARN: periodic allowance check failed: {e:#}");
-                    }
-                }
-                Err(e) => {
-                    eprintln!("WARN: periodic balance refresh failed: {e:#}");
-                }
+            if let Err(e) = ensure_allowance(&allowance_task_client, &*allowance_task_wallet, CTF_EXCHANGE_ADDRESS).await {
+                eprintln!("WARN: periodic allowance check failed: {e:#}");
             }
         }
     });
@@ -445,14 +387,11 @@ async fn main() -> Result<()> {
     loop {
         match discover_active_btc_5m_market(&client).await {
             Ok(new_market) => {
-                notify_important(&format!("Connecting to market: {}", new_market.slug)).await?;
-
                 let now_secs = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs() as i64;
                 let secs_remaining = (new_market.end_ts - now_secs).max(1) as u64;
-                notify_important(&format!("Window expires in {secs_remaining}s")).await?;
 
                 {
                     let mut guard = state.lock().await;
@@ -468,40 +407,23 @@ async fn main() -> Result<()> {
                     guard.fee_bps = 1000; // reset to safe default until live fetch completes
                 }
 
-                // Reset window budget: fetch current balance and set limits for this window
+                // Snapshot balance for profit tracking at window close
                 match get_balance(&client, &wallet.address).await {
                     Ok(balance) => {
                         let mut m = money.lock().await;
                         m.money_spent = 0.0;
                         m.balance_at_window_start = balance;
-                        m.window_budget = balance * 0.75;
-                        m.per_trade_limit = balance * 0.25;
-                        notify_important(&format!(
-                            "Window budget set: balance=${:.4}, per_trade_limit=${:.4}, window_budget=${:.4}",
-                            balance, m.per_trade_limit, m.window_budget
-                        )).await?;
                     }
                     Err(e) => {
-                        eprintln!("WARN: Could not fetch balance for budget reset: {e:#}");
+                        eprintln!("WARN: Could not fetch balance: {e:#}");
                     }
                 }
 
                 // Fetch live fee rate for this market and store it in state.
                 // Uses the first asset_id — both UP and DOWN legs share the same fee.
                 if let Some(first_asset) = new_market.asset_ids.first() {
-                    match get_fee_rate(&client, first_asset).await {
-                        Ok(fee_bps) => {
-                            let mut guard = state.lock().await;
-                            guard.fee_bps = fee_bps;
-                            let break_even = 100.0 / (1.0 + fee_bps as f64 / 10000.0);
-                            notify_important(&format!(
-                                "Fee rate: {fee_bps} bps ({:.2}%). Profit threshold: sum_cents < {break_even:.2}",
-                                fee_bps as f64 / 100.0
-                            )).await?;
-                        }
-                        Err(e) => {
-                            eprintln!("WARN: Could not fetch fee rate: {e:#}. Using fallback {MIN_PROFIT_THRESHOLD_FALLBACK}");
-                        }
+                    if let Ok(fee_bps) = get_fee_rate(&client, first_asset).await {
+                        state.lock().await.fee_bps = fee_bps;
                     }
                 }
 
@@ -516,31 +438,24 @@ async fn main() -> Result<()> {
                     ) => {
                         match result {
                             Ok(_) => {
-                                notify_important("Socket closed cleanly, re-discovering...").await?;
                                 backoff = 2;
                                 window_closed = true;
                                 close_reason = "socket_closed";
                             }
                             Err(e) if e.to_string().contains("NO NEW ASSETS") => {
-                                notify_important("Market ended (NO NEW ASSETS), re-discovering...").await?;
                                 backoff = 2;
                                 window_closed = true;
                                 close_reason = "no_new_assets";
                             }
                             Err(e) => {
-                                notify_important(&format!(
-                                    "Socket error: {e:#}. Reconnecting in {backoff}s..."
-                                ))
-                                .await?;
+                                eprintln!("Socket error: {e:#}. Reconnecting in {backoff}s...");
                                 tokio::time::sleep(Duration::from_secs(backoff)).await;
                                 backoff = (backoff * 2).min(60);
                             }
                         }
                     }
                     _ = tokio::time::sleep(Duration::from_secs(secs_remaining)) => {
-                        notify_important("Window expiry timer fired, waiting for boundary...").await?;
                         tokio::time::sleep(Duration::from_secs(3)).await;
-                        notify_important("Switching to next market...").await?;
                         backoff = 2;
                         window_closed = true;
                         close_reason = "timer";
@@ -554,11 +469,7 @@ async fn main() -> Result<()> {
                     };
 
                     // Window-close embed — show what we spent this window
-                    let (balance_now, spent) = {
-                        let m = money.lock().await;
-                        let bal = get_balance(&client, &wallet.address).await.unwrap_or(0.0);
-                        (bal, m.money_spent)
-                    };
+                    let balance_now = get_balance(&client, &wallet.address).await.unwrap_or(0.0);
                     let m = money.lock().await;
                     let embed = json!({
                         "title": "Window Closed",
@@ -574,7 +485,6 @@ async fn main() -> Result<()> {
                         "footer": { "text": "Redemption happens on next cycle once oracle resolves the market" }
                     });
                     drop(m);
-                    println!("Window closed: {slug_closing} | spent=${:.4} | balance=${:.4}", spent, balance_now);
                     if let Err(e) = send_discord_embed(embed).await {
                         eprintln!("Discord window-close embed failed: {e:#}");
                     }
@@ -612,10 +522,7 @@ async fn main() -> Result<()> {
                 }
             }
             Err(e) => {
-                notify_important(&format!(
-                    "Market discovery failed: {e:#}. Retrying in {backoff}s..."
-                ))
-                .await?;
+                eprintln!("Market discovery failed: {e:#}. Retrying in {backoff}s...");
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
                 backoff = (backoff * 2).min(10);
             }
@@ -638,7 +545,6 @@ fn compute_current_slug() -> (String, i64) {
 
 async fn discover_active_btc_5m_market(client: &Client) -> Result<MarketInfo> {
     let (slug, end_ts) = compute_current_slug();
-    println!("Computed active market slug: {slug} (window ends at Unix {end_ts})");
 
     let url = format!("{GAMMA_API}/markets?slug={slug}");
     let resp = client
@@ -726,8 +632,6 @@ async fn run_socket(
 ) -> Result<()> {
     let (ws_stream, _) = connect_async(CLOB_WS_URL).await.context("connect clob ws")?;
     let (mut write, mut read) = ws_stream.split();
-    notify_important(&format!("Connected to CLOB WS {CLOB_WS_URL}")).await?;
-
     let subscribe_msg = json!({
         "type": "market",
         "assets_ids": asset_ids
@@ -737,8 +641,6 @@ async fn run_socket(
         .send(Message::Text(subscribe_msg))
         .await
         .context("send subscribe")?;
-
-    notify_important(&format!("Subscribed to assets: {asset_ids:?}")).await?;
 
     while let Some(msg) = read.next().await {
         match msg {
@@ -757,8 +659,6 @@ async fn run_socket(
 
                 if let Ok(value) = serde_json::from_str::<Value>(&text) {
                     handle_clob_message(&state, &money, &wallet, &value).await?;
-                } else {
-                    eprintln!("Unrecognised WS message: {text}");
                 }
             }
             Ok(Message::Ping(data)) => {
@@ -767,7 +667,7 @@ async fn run_socket(
             Ok(Message::Close(_)) => break,
             Ok(_) => {}
             Err(e) => {
-                notify_important(&format!("WS error: {e}")).await?;
+                eprintln!("WS error: {e}");
                 break;
             }
         }
@@ -1044,93 +944,51 @@ async fn print_up_down(
             }
             LAST_DETECTION_MS.store(now, Ordering::Relaxed);
 
-            let message = format!(
-                "Arbitrage opportunity: up={:.4}, down={:.4}, sum_cents={:.2}, ts={}",
-                up, down, sum_cents, ts.unwrap_or(0)
-            );
-            notify_important(&message).await?;
-
-            // Check window budget before trading
-            {
-                let m = money.lock().await;
-                if m.window_budget == 0.0 {
-                    println!("Budget not initialised yet, skipping trade.");
-                    return Ok(());
-                }
-                if m.money_spent >= m.window_budget {
-                    println!(
-                        "Window budget exhausted (spent=${:.4} / limit=${:.4}), skipping trade.",
-                        m.money_spent, m.window_budget
-                    );
-                    return Ok(());
-                }
-            }
-
-            // Cap this trade at per_trade_limit, but never exceed remaining budget
-            let trade_budget = {
-                let m = money.lock().await;
-                let remaining = m.window_budget - m.money_spent;
-                m.per_trade_limit.min(remaining)
-            };
-
-            match execute_arbitrage_trade(wallet, &up_asset, &down_asset, up, down, sum_cents, trade_budget, fee_bps).await {
-                Ok((trade_result, _trade_log)) => {
+            match execute_arbitrage_trade(wallet, &up_asset, &down_asset, up, down, sum_cents, fee_bps).await {
+                Ok((trade_result, details)) => {
                     let mut money = money.lock().await;
                     money.money_spent += trade_result.total_spent;
-                    money.total_buy_positions += trade_result.shares_bought as i64;
+                    money.total_buy_positions += 1;
                     money.total_shares_bought += (trade_result.shares_bought * 2) as i64;
 
-                    let budget_remaining = money.window_budget - money.money_spent;
                     let edge = 100.0 - sum_cents;
+                    let retry_note = if details.down_retried { " (retried)" } else { "" };
                     let embed = json!({
                         "title": "Trade Executed",
                         "color": 0x2ECC71,
                         "fields": [
-                            { "name": "UP Price", "value": format!("{:.4}", up), "inline": true },
-                            { "name": "DOWN Price", "value": format!("{:.4}", down), "inline": true },
-                            { "name": "Sum (cents)", "value": format!("{:.2}", sum_cents), "inline": true },
-                            { "name": "Edge", "value": format!("{:.2} cents", edge), "inline": true },
+                            { "name": "UP Price", "value": format!("{:.2}c", up * 100.0), "inline": true },
+                            { "name": "DOWN Price", "value": format!("{:.2}c", down * 100.0), "inline": true },
+                            { "name": "Sum / Edge", "value": format!("{:.2}c / +{:.2}c", sum_cents, edge), "inline": true },
                             { "name": "Shares (each side)", "value": format!("{}", trade_result.shares_bought), "inline": true },
                             { "name": "Total Spent", "value": format!("${:.4}", trade_result.total_spent), "inline": true },
-                            { "name": "Fee Rate", "value": format!("{} bps", fee_bps), "inline": true },
-                            { "name": "Budget Remaining", "value": format!("${:.4}", budget_remaining), "inline": true },
-                            { "name": "Window Trades", "value": format!("{}", money.total_buy_positions), "inline": true }
+                            { "name": "Fee (UP/DOWN)", "value": format!("{}bps / {}bps", details.up_fee_bps, details.down_fee_bps), "inline": true },
+                            { "name": "Balance Before", "value": format!("${:.4}", details.balance_before), "inline": true },
+                            { "name": "Balance After", "value": format!("${:.4}", details.balance_after), "inline": true },
+                            { "name": "Window Trades", "value": format!("{}", money.total_buy_positions), "inline": true },
+                            { "name": "UP Order", "value": format!("`{}` ({})", details.up_order_id, details.up_status), "inline": false },
+                            { "name": "DOWN Order", "value": format!("`{}`{} ({})", details.down_order_id, retry_note, details.down_status), "inline": false },
+                            { "name": "Book Depth (UP/DOWN)", "value": format!("{:.0} / {:.0}", details.up_depth, details.down_depth), "inline": true },
+                            { "name": "UP Asset", "value": format!("`{}`", up_asset), "inline": false },
+                            { "name": "DOWN Asset", "value": format!("`{}`", down_asset), "inline": false }
                         ],
-                        "footer": { "text": format!("Slug: {}", state.market_slug) }
+                        "footer": { "text": format!("{}", state.market_slug) }
                     });
-                    println!("TRADE EXECUTED: {} shares @ up={:.4} down={:.4} spent=${:.4}", trade_result.shares_bought, up, down, trade_result.total_spent);
                     if let Err(e) = send_discord_embed(embed).await {
-                        eprintln!("Discord trade embed failed: {e:#}");
+                        eprintln!("Discord embed failed: {e:#}");
                     }
                 }
                 Err(e) => {
-                    let embed = json!({
-                        "title": "Trade Failed",
-                        "color": 0xE74C3C,
-                        "description": format!("{:#}", e),
-                        "fields": [
-                            { "name": "UP Price", "value": format!("{:.4}", up), "inline": true },
-                            { "name": "DOWN Price", "value": format!("{:.4}", down), "inline": true },
-                            { "name": "Sum (cents)", "value": format!("{:.2}", sum_cents), "inline": true }
-                        ],
-                        "footer": { "text": format!("Slug: {}", state.market_slug) }
-                    });
                     eprintln!("TRADE FAILED: {:#}", e);
-                    if let Err(e) = send_discord_embed(embed).await {
-                        eprintln!("Discord trade-fail embed failed: {e:#}");
-                    }
                 }
             }
-        } else {
-            println!(
-                "Price update: up={:.4}, down={:.4}, sum_cents={:.2}, ts={}",
-                up, down, sum_cents, ts.unwrap_or(0)
-            );
         }
     }
 
     Ok(())
 }
+
+const MIN_BALANCE_USDC: f64 = 5.0;
 
 #[derive(Debug)]
 struct TradeResult {
@@ -1138,230 +996,156 @@ struct TradeResult {
     total_spent: f64,
 }
 
+/// Detailed info returned alongside TradeResult so the caller can build
+/// a rich Discord embed without re-fetching anything.
+struct TradeDetails {
+    balance_before: f64,
+    balance_after: f64,
+    up_order_id: String,
+    up_status: String,
+    down_order_id: String,
+    down_status: String,
+    up_fee_bps: u64,
+    down_fee_bps: u64,
+    up_depth: f64,
+    down_depth: f64,
+    down_retried: bool,
+}
+
+/// Places UP and DOWN orders as completely separate operations.
+/// Between the two orders: re-fetches fee rate so each order uses fresh data.
+/// Returns (TradeResult, TradeDetails) on success.
 async fn execute_arbitrage_trade(
     wallet: &Arc<TradingWallet>,
     up_asset_id: &str,
     down_asset_id: &str,
     up_price: f64,
     down_price: f64,
-    sum_cents: f64,
-    trade_budget: f64, // max USDC to spend on this single trade (1/4 of window balance)
-    fee_bps: u64,      // maker fee in basis points, fetched live per market
-) -> Result<(TradeResult, String)> {
+    _sum_cents: f64,
+    fee_bps: u64,
+) -> Result<(TradeResult, TradeDetails)> {
     let client = Client::new();
-    let mut log: Vec<String> = Vec::new();
-    log.push(format!(
-        "Trade attempt details: up_asset={}, down_asset={}, up={:.4}, down={:.4}, sum_cents={:.2}",
-        up_asset_id, down_asset_id, up_price, down_price, sum_cents
-    ));
 
-    // Step 1: Get order books for both assets
-    log.push("Fetching order books...".to_string());
+    // ── Check balance ────────────────────────────────────────────────────
+    let balance = get_balance(&client, &wallet.address).await
+        .context("balance check before trade")?;
+    if balance < MIN_BALANCE_USDC {
+        return Err(anyhow!("Balance ${:.2} < ${:.2} minimum", balance, MIN_BALANCE_USDC));
+    }
+
+    // ── Order book depth ─────────────────────────────────────────────────
     let up_book = get_order_book(&client, up_asset_id).await?;
+    let up_depth = calculate_total_size(&up_book.asks)?;
     let down_book = get_order_book(&client, down_asset_id).await?;
+    let down_depth = calculate_total_size(&down_book.asks)?;
 
-    let up_total_size = calculate_total_size(&up_book.asks)?;
-    let down_total_size = calculate_total_size(&down_book.asks)?;
-
-    // Max shares fillable from the order book (both legs must match)
-    let liquidity_shares = (up_total_size.min(down_total_size) * 0.8).floor();
-
-    // Max shares affordable within the trade_budget (cost = (up+down) per share pair)
+    let liquidity_shares = (up_depth.min(down_depth) * 0.8).floor();
     let cost_per_pair = up_price + down_price;
-    let budget_shares = (trade_budget / cost_per_pair).floor();
+    let affordable_shares = ((balance - MIN_BALANCE_USDC) / cost_per_pair).floor();
+    let buy_shares = liquidity_shares.min(affordable_shares) as u64;
 
-    // Use the smaller of the two so we never exceed budget or liquidity
-    let buy_shares = liquidity_shares.min(budget_shares) as u64;
-
-    log.push(format!(
-        "Order book analysis: up_depth={:.2}, down_depth={:.2}, budget=${:.4}, cost_per_pair={:.4}, buying {} shares each side",
-        up_total_size, down_total_size, trade_budget, cost_per_pair, buy_shares
-    ));
-
-    const MIN_SHARES: u64 = 5; // Polymarket minimum order size
-
+    const MIN_SHARES: u64 = 5;
     if buy_shares < MIN_SHARES {
         return Err(anyhow!(
-            "{}\nERROR: Only {} shares available (min={}). \
-             liquidity={:.2}, budget_shares={:.0}, budget=${:.4}, cost_per_pair={:.4}. \
-             Need at least ${:.2} budget for a minimum trade.",
-            log.join("\n"), buy_shares, MIN_SHARES,
-            liquidity_shares, budget_shares, trade_budget, cost_per_pair,
-            cost_per_pair * MIN_SHARES as f64
+            "Only {} shares possible (min {}). liquidity={:.0}, affordable={:.0}, balance=${:.2}",
+            buy_shares, MIN_SHARES, liquidity_shares, affordable_shares, balance
         ));
     }
 
-    // Budget was already validated before calling this function (window_budget check).
-    // No extra RPC balance call needed here — it would cost ~300ms in the hot path.
     let estimated_cost = cost_per_pair * (buy_shares as f64);
 
-    // Step 2: Place orders SEQUENTIALLY — UP first, then DOWN.
-    //
-    // Polymarket confirmed: batch orders (POST /orders with 2 items) fail because
-    // the first order reserves your available balance, causing the second to be
-    // rejected with "insufficient balance" even though you have enough for both.
-    // There is no atomic "both or nothing" mode.
-    //
-    // Sequential placement avoids this entirely: each order sees the full
-    // available balance at submission time.
-    const MAX_ORDER_RETRIES: u32 = 3;
-    const RETRY_DELAY_MS: u64 = 200;
+    // ═══════════════════════════════════════════════════════════════════════
+    //  ORDER 1: UP
+    // ═══════════════════════════════════════════════════════════════════════
+    let up_salt = now_ms() as u64;
+    let up_order = build_order_request(wallet, up_asset_id, buy_shares, up_price, "BUY", fee_bps, up_salt).await?;
+    let up_res = place_single_order(&client, wallet, up_order).await
+        .context("UP order request failed")?;
 
-    let mut last_error = String::new();
+    if !up_res.success {
+        return Err(anyhow!("UP rejected: {}", up_res.error_msg));
+    }
 
-    for attempt in 1..=MAX_ORDER_RETRIES {
-        if attempt > 1 {
-            log.push(format!(
-                "Retry attempt {}/{} after {}ms delay...",
-                attempt, MAX_ORDER_RETRIES, RETRY_DELAY_MS
-            ));
-            tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
-        }
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Re-fetch fee rate before second order
+    // ═══════════════════════════════════════════════════════════════════════
+    let down_fee_bps = get_fee_rate(&client, down_asset_id).await.unwrap_or(fee_bps);
 
-        // ── Place UP order first ─────────────────────────────────────────
-        log.push(format!("Building UP order (attempt {}/{})...", attempt, MAX_ORDER_RETRIES));
-        let up_salt = now_ms() as u64;
-        let up_order = build_order_request(wallet, up_asset_id, buy_shares, up_price, "BUY", fee_bps, up_salt).await?;
+    // ═══════════════════════════════════════════════════════════════════════
+    //  ORDER 2: DOWN
+    // ═══════════════════════════════════════════════════════════════════════
+    let down_salt = now_ms() as u64 + 1;
+    let down_order = build_order_request(wallet, down_asset_id, buy_shares, down_price, "BUY", down_fee_bps, down_salt).await?;
+    let down_res = place_single_order(&client, wallet, down_order).await;
 
-        log.push("Submitting UP order...".to_string());
-        let up_res = match place_batch_orders(&client, wallet, vec![up_order]).await {
-            Ok(r) if r.len() == 1 => r.into_iter().next().unwrap(),
-            Ok(r) => {
-                last_error = format!("UP order: unexpected response length {}", r.len());
-                log.push(last_error.clone());
-                if attempt < MAX_ORDER_RETRIES { continue; }
-                return Err(anyhow!("{}\n{}", log.join("\n"), last_error));
-            }
-            Err(e) => {
-                last_error = format!("UP order request failed: {:#}", e);
-                log.push(last_error.clone());
-                if attempt < MAX_ORDER_RETRIES {
-                    let _ = send_discord_webhook(&format!(
-                        "⚠ UP order request failed (attempt {}/{}): {:#}. Retrying...",
-                        attempt, MAX_ORDER_RETRIES, e
-                    )).await;
-                    continue;
-                }
-                return Err(anyhow!("{}\nAll {} attempts failed. Last error: {}", log.join("\n"), MAX_ORDER_RETRIES, last_error));
-            }
-        };
-
-        if !up_res.success {
-            last_error = format!("UP order rejected: {}", up_res.error_msg);
-            log.push(last_error.clone());
-            if attempt < MAX_ORDER_RETRIES {
-                let _ = send_discord_webhook(&format!(
-                    "⚠ UP order rejected (attempt {}/{}): {}. Retrying...",
-                    attempt, MAX_ORDER_RETRIES, up_res.error_msg
-                )).await;
-                continue;
-            }
-            return Err(anyhow!("{}\nAll {} attempts failed. Last error: {}", log.join("\n"), MAX_ORDER_RETRIES, last_error));
-        }
-
-        log.push(format!("UP order placed: {} (status={})", up_res.order_id, up_res.status));
-
-        // ── Now place DOWN order ─────────────────────────────────────────
-        // UP is confirmed accepted — the exchange has reserved balance for it.
-        // The remaining available balance should be enough for DOWN.
-        log.push("Building DOWN order...".to_string());
-        let down_salt = now_ms() as u64 + 1;
-        let down_order = build_order_request(wallet, down_asset_id, buy_shares, down_price, "BUY", fee_bps, down_salt).await?;
-
-        log.push("Submitting DOWN order...".to_string());
-        let down_res = match place_batch_orders(&client, wallet, vec![down_order]).await {
-            Ok(r) if r.len() == 1 => r.into_iter().next().unwrap(),
-            Ok(r) => {
-                let msg = format!("DOWN order: unexpected response length {}", r.len());
-                log.push(msg.clone());
-                // UP is placed but DOWN failed — retry DOWN once below
-                BatchOrderResult { success: false, order_id: String::new(), status: String::new(), error_msg: msg }
-            }
-            Err(e) => {
-                log.push(format!("DOWN order request failed: {:#}", e));
-                BatchOrderResult { success: false, order_id: String::new(), status: String::new(), error_msg: format!("{:#}", e) }
-            }
-        };
-
-        if down_res.success {
-            // Both legs placed successfully
-            log.push(format!("DOWN order placed: {} (status={})", down_res.order_id, down_res.status));
-            if attempt > 1 {
-                log.push(format!("Succeeded on attempt {}.", attempt));
-            }
+    if let Ok(ref r) = down_res {
+        if r.success {
+            let balance_after = get_balance(&client, &wallet.address).await.unwrap_or(balance - estimated_cost);
             return Ok((
                 TradeResult { shares_bought: buy_shares, total_spent: estimated_cost },
-                log.join("\n"),
+                TradeDetails {
+                    balance_before: balance, balance_after,
+                    up_order_id: up_res.order_id.clone(), up_status: up_res.status.clone(),
+                    down_order_id: r.order_id.clone(), down_status: r.status.clone(),
+                    up_fee_bps: fee_bps, down_fee_bps,
+                    up_depth, down_depth,
+                    down_retried: false,
+                },
             ));
-        }
-
-        // ── DOWN failed — retry it once before cancelling UP ─────────────
-        log.push(format!("DOWN order failed: {}. Retrying DOWN...", down_res.error_msg));
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        let retry_salt = now_ms() as u64 + 50;
-        let down_retry_ok = match build_order_request(wallet, down_asset_id, buy_shares, down_price, "BUY", fee_bps, retry_salt).await {
-            Ok(order) => {
-                match place_batch_orders(&client, wallet, vec![order]).await {
-                    Ok(res) if res.len() == 1 && res[0].success => {
-                        log.push(format!("DOWN retry succeeded: {} (status={})", res[0].order_id, res[0].status));
-                        true
-                    }
-                    Ok(res) => {
-                        let msg = res.first().map(|r| r.error_msg.as_str()).unwrap_or("empty");
-                        log.push(format!("DOWN retry also failed: {}", msg));
-                        false
-                    }
-                    Err(e) => {
-                        log.push(format!("DOWN retry request error: {:#}", e));
-                        false
-                    }
-                }
-            }
-            Err(e) => {
-                log.push(format!("DOWN retry build error: {:#}", e));
-                false
-            }
-        };
-
-        if down_retry_ok {
-            log.push(format!("Both legs placed (UP on first try, DOWN on retry)."));
-            return Ok((
-                TradeResult { shares_bought: buy_shares, total_spent: estimated_cost },
-                log.join("\n"),
-            ));
-        }
-
-        // DOWN failed twice — cancel UP and retry everything
-        log.push("DOWN failed twice. Cancelling UP order...".to_string());
-        match cancel_order(&client, wallet, &up_res.order_id).await {
-            Ok(_) => {
-                log.push("UP order cancelled.".to_string());
-                last_error = format!("DOWN failed: {}", down_res.error_msg);
-                let _ = send_discord_webhook(&format!(
-                    "⚠ DOWN order failed twice (attempt {}/{}): {}. UP cancelled. {}",
-                    attempt, MAX_ORDER_RETRIES, down_res.error_msg,
-                    if attempt < MAX_ORDER_RETRIES { "Retrying both..." } else { "No more retries." }
-                )).await;
-                if attempt < MAX_ORDER_RETRIES { continue; }
-            }
-            Err(e) => {
-                let alert = format!(
-                    "🚨 ALERT: Only UP order went through (id={}). Could not cancel: {:#}. DOWN error: {}",
-                    up_res.order_id, e, down_res.error_msg
-                );
-                log.push(alert.clone());
-                let _ = send_discord_webhook(&alert).await;
-                return Err(anyhow!("{}", log.join("\n")));
-            }
         }
     }
 
-    // All retries exhausted
-    Err(anyhow!(
-        "{}\nAll {} order attempts failed. Last error: {}",
-        log.join("\n"), MAX_ORDER_RETRIES, last_error
-    ))
+    // ── DOWN failed — extract error, retry once ──────────────────────────
+    let down_err_1 = match &down_res {
+        Ok(r) => r.error_msg.clone(),
+        Err(e) => format!("{:#}", e),
+    };
+    eprintln!("DOWN failed: {} | Retrying in 150ms...", down_err_1);
+    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+
+    let retry_fee = get_fee_rate(&client, down_asset_id).await.unwrap_or(down_fee_bps);
+    let retry_salt = now_ms() as u64 + 50;
+    let down_retry_order = build_order_request(wallet, down_asset_id, buy_shares, down_price, "BUY", retry_fee, retry_salt).await?;
+    let down_retry_res = place_single_order(&client, wallet, down_retry_order).await;
+
+    if let Ok(ref r) = down_retry_res {
+        if r.success {
+            let balance_after = get_balance(&client, &wallet.address).await.unwrap_or(balance - estimated_cost);
+            return Ok((
+                TradeResult { shares_bought: buy_shares, total_spent: estimated_cost },
+                TradeDetails {
+                    balance_before: balance, balance_after,
+                    up_order_id: up_res.order_id.clone(), up_status: up_res.status.clone(),
+                    down_order_id: r.order_id.clone(), down_status: r.status.clone(),
+                    up_fee_bps: fee_bps, down_fee_bps: retry_fee,
+                    up_depth, down_depth,
+                    down_retried: true,
+                },
+            ));
+        }
+    }
+
+    // ── DOWN failed twice — cancel UP ────────────────────────────────────
+    let down_err_2 = match &down_retry_res {
+        Ok(r) => r.error_msg.clone(),
+        Err(e) => format!("{:#}", e),
+    };
+    eprintln!("DOWN failed twice: 1st={} | 2nd={} | Cancelling UP {}", down_err_1, down_err_2, up_res.order_id);
+
+    match cancel_order(&client, wallet, &up_res.order_id).await {
+        Ok(_) => {
+            Err(anyhow!("DOWN failed twice. 1st: {} | 2nd: {} | UP {} cancelled", down_err_1, down_err_2, up_res.order_id))
+        }
+        Err(e) => {
+            let msg = format!(
+                "CRITICAL: UP {} placed, DOWN failed ({}), cancel failed: {:#}",
+                up_res.order_id, down_err_2, e
+            );
+            eprintln!("{}", msg);
+            let _ = send_discord_webhook(&msg).await;
+            Err(anyhow!("{}", msg))
+        }
+    }
 }
 
 async fn get_fee_rate(client: &Client, token_id: &str) -> Result<u64> {
@@ -1444,15 +1228,11 @@ async fn redeem_positions(
     let mut req = RedeemPositionsRequest::for_binary_market(collateral, condition_id);
     req.index_sets = vec![AlloyU256::from(1), AlloyU256::from(2)];
 
-    let resp = ctf_client
+    ctf_client
         .redeem_positions(&req)
         .await
         .with_context(|| format!("redeem condition {condition_id:#x}"))?;
 
-    println!(
-        "Redeemed condition {condition_id:#x}: tx={:#x} block={}",
-        resp.transaction_hash, resp.block_number
-    );
     Ok(())
 }
 
@@ -1488,7 +1268,6 @@ async fn redeem_prior_windows(client: &Client, private_key: &str) -> u32 {
         };
 
         if let Some(cid) = cid {
-            println!("Attempting redeem for prior window: {slug} (conditionId={cid})");
             match redeem_positions(private_key, &cid).await {
                 Ok(_) => {
                     redeemed += 1;
@@ -1497,7 +1276,6 @@ async fn redeem_prior_windows(client: &Client, private_key: &str) -> u32 {
                     // "execution reverted" is normal for unresolved or already-redeemed markets
                     let msg = format!("{e:#}");
                     if msg.contains("revert") || msg.contains("insufficient") {
-                        println!("Redeem skipped for {slug}: not resolved or already redeemed");
                     } else {
                         eprintln!("Redeem failed for {slug}: {e:#}");
                     }
@@ -1506,11 +1284,6 @@ async fn redeem_prior_windows(client: &Client, private_key: &str) -> u32 {
         }
     }
 
-    if redeemed == 0 {
-        println!("No prior windows redeemed (not yet resolved or already redeemed).");
-    } else {
-        println!("Redeemed {redeemed} prior window(s).");
-    }
 
     redeemed
 }
@@ -1521,8 +1294,6 @@ async fn get_balance(client: &Client, address: &Address) -> Result<f64> {
     let ankr_key = env::var(ANKR_API_KEY_ENV)
         .with_context(|| format!("Missing env var '{ANKR_API_KEY_ENV}' — add it to your .env file"))?;
     let ankr_key = ankr_key.trim().to_string();
-    let masked_key = format!("{}...{}", &ankr_key[..6], &ankr_key[ankr_key.len()-4..]);
-    println!("Using Ankr RPC: https://rpc.ankr.com/polygon/{masked_key}");
     let rpc_url = format!("https://rpc.ankr.com/polygon/{}", ankr_key);
 
     let addr_hex = format!("{:x}", address); // 40 hex chars, no 0x prefix
@@ -1610,15 +1381,9 @@ async fn ensure_allowance(
     spender: &str,
 ) -> Result<()> {
     let allowance = get_allowance(client, &wallet.address, spender).await?;
-    println!("Current USDC allowance for CTF Exchange: ${:.4}", allowance);
-
-    // Only approve if allowance is under $1000 — plenty of headroom for normal trading
     if allowance >= 1000.0 {
-        println!("Allowance sufficient, no approval needed.");
         return Ok(());
     }
-
-    println!("Allowance too low (${:.4}). Sending approve(MAX) transaction...", allowance);
 
     let ankr_key = env::var(ANKR_API_KEY_ENV)
         .with_context(|| format!("Missing env var '{ANKR_API_KEY_ENV}'"))?;
@@ -1685,7 +1450,6 @@ async fn ensure_allowance(
     let tx_hash = send_resp["result"].as_str()
         .ok_or_else(|| anyhow!("no tx hash in response: {send_resp}"))?;
 
-    println!("Approve tx sent: {tx_hash}. Waiting for confirmation...");
 
     // Poll for receipt (up to 30 seconds)
     for _ in 0..30 {
@@ -1699,7 +1463,6 @@ async fn ensure_allowance(
         if let Some(r) = receipt.get("result").filter(|v| !v.is_null()) {
             let status = r["status"].as_str().unwrap_or("0x0");
             if status == "0x1" {
-                println!("Approve confirmed! USDC allowance set to MAX.");
                 return Ok(());
             } else {
                 return Err(anyhow!("Approve tx reverted. Check wallet has MATIC for gas."));
@@ -1788,7 +1551,6 @@ async fn get_or_create_api_creds(
         .context("L1 auth GET /auth/derive-api-key")?;
 
     let derive_raw = derive_resp.text().await.context("read derive response")?;
-    println!("GET /auth/derive-api-key response: {derive_raw}");
     let derive_parsed: Value = serde_json::from_str(&derive_raw)
         .with_context(|| format!("parse derive JSON: {derive_raw}"))?;
 
@@ -1797,7 +1559,6 @@ async fn get_or_create_api_creds(
         derive_parsed.get("secret").and_then(|v| v.as_str()),
         derive_parsed.get("passphrase").and_then(|v| v.as_str()),
     ) {
-        println!("Derived existing API credentials.");
         return Ok(ApiCredentials {
             api_key:    k.to_string(),
             secret:     s.to_string(),
@@ -1810,7 +1571,6 @@ async fn get_or_create_api_creds(
     // registered on Polymarket yet. Visit https://polymarket.com, connect wallet
     // 0x5f747b55957ecff985faed31635df8c6fc3677b7, and accept the Terms of Service.
     // After that, restart the bot and credentials will be created automatically.
-    println!("No existing credentials found, attempting to create new ones via POST /auth/api-key...");
 
     // Re-sign with a fresh timestamp for the second request
     let timestamp2 = now_ms() / 1000;
@@ -1827,7 +1587,6 @@ async fn get_or_create_api_creds(
         .context("L1 auth POST /auth/api-key")?;
 
     let create_raw = create_resp.text().await.context("read create response")?;
-    println!("POST /auth/api-key response: {create_raw}");
     let create_parsed: Value = serde_json::from_str(&create_raw)
         .with_context(|| format!("parse create JSON: {create_raw}"))?;
 
@@ -1990,20 +1749,19 @@ async fn build_order_request(
     })
 }
 
-// ── Submit multiple orders in a single batch request (POST /orders) ───────────
-async fn place_batch_orders(
+// ── Submit a single order via POST /order ─────────────────────────────────────
+async fn place_single_order(
     client: &Client,
     wallet: &Arc<TradingWallet>,
-    orders: Vec<CreateOrderRequest>,
-) -> Result<Vec<BatchOrderResult>> {
-    let body_str = serde_json::to_string(&orders).context("serialise batch orders")?;
-    println!("POST /orders body: {body_str}");
+    order: CreateOrderRequest,
+) -> Result<BatchOrderResult> {
+    let body_str = serde_json::to_string(&order).context("serialise order")?;
 
     let timestamp = now_ms() / 1000;
-    let l2_sig = l2_signature(&wallet.creds.secret, timestamp, "POST", "/orders", &body_str)
-        .context("compute L2 HMAC for batch orders")?;
+    let l2_sig = l2_signature(&wallet.creds.secret, timestamp, "POST", "/order", &body_str)
+        .context("compute L2 HMAC for single order")?;
 
-    let url = format!("{CLOB_API}/orders");
+    let url = format!("{CLOB_API}/order");
     let resp = client
         .post(&url)
         .header("Content-Type", "application/json")
@@ -2015,18 +1773,19 @@ async fn place_batch_orders(
         .body(body_str)
         .send()
         .await
-        .context("place batch orders")?;
+        .context("place single order")?;
 
     if !resp.status().is_success() {
         let error_text = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("Batch order placement failed: {}", error_text));
+        return Err(anyhow!("Order placement failed: {}", error_text));
     }
 
-    let results: Vec<BatchOrderResult> = resp.json().await
-        .context("parse batch order response")?;
+    let result: BatchOrderResult = resp.json().await
+        .context("parse single order response")?;
 
-    Ok(results)
+    Ok(result)
 }
+
 
 // ── Cancel an open order via the CLOB API ─────────────────────────────────────
 // Fallback when a batch submission partially succeeds: cancel the successful
@@ -2061,7 +1820,6 @@ async fn cancel_order(
         return Err(anyhow!("Cancel order failed: {}", error_text));
     }
 
-    println!("Order {} cancelled successfully.", order_id);
     Ok(())
 }
 
@@ -2272,14 +2030,9 @@ async fn check_and_top_up_pol(client: &Client, wallet: &Arc<TradingWallet>) -> R
         }
     };
 
-    println!("POL balance: {:.6} POL", pol);
-
     if pol >= POL_LOW_THRESHOLD {
-        println!("POL balance sufficient ({:.6} >= {} threshold).", pol, POL_LOW_THRESHOLD);
         return Ok(());
     }
-
-    println!("POL low ({:.6} POL). Initiating SimpleSwap top-up ({} USDC → POL)...", pol, POL_TOP_UP_USDC);
 
     let recipient = format!("{:#x}", wallet.address);
 
@@ -2296,45 +2049,10 @@ async fn check_and_top_up_pol(client: &Client, wallet: &Arc<TradingWallet>) -> R
         return Ok(());
     }
 
-    println!(
-        "SimpleSwap exchange created: id={} deposit={} amount_from={}",
-        exchange.public_id, exchange.address_from, exchange.amount_from
-    );
-
     match send_usdc_transfer(client, wallet, &exchange.address_from, POL_TOP_UP_USDC).await {
-        Ok(tx_hash) => {
-            let embed = json!({
-                "title": "POL Top-Up Initiated",
-                "color": 0xF39C12,
-                "fields": [
-                    { "name": "Trigger", "value": format!("{:.6} POL (threshold: {} POL)", pol, POL_LOW_THRESHOLD), "inline": false },
-                    { "name": "USDC Sent", "value": format!("${:.2}", POL_TOP_UP_USDC), "inline": true },
-                    { "name": "Deposit Address", "value": &exchange.address_from, "inline": false },
-                    { "name": "Exchange ID", "value": &exchange.public_id, "inline": true },
-                    { "name": "Tx Hash", "value": &tx_hash, "inline": false }
-                ],
-                "footer": { "text": "SimpleSwap will deliver POL to your wallet shortly" }
-            });
-            println!("USDC sent to SimpleSwap deposit address: tx={}", tx_hash);
-            if let Err(e) = send_discord_embed(embed).await {
-                eprintln!("Discord POL top-up embed failed: {e:#}");
-            }
-        }
+        Ok(_tx_hash) => {}
         Err(e) => {
-            eprintln!("WARN: Failed to send USDC to SimpleSwap deposit address: {e:#}");
-            let embed = json!({
-                "title": "POL Top-Up Failed",
-                "color": 0xE74C3C,
-                "description": format!("{:#}", e),
-                "fields": [
-                    { "name": "POL Balance", "value": format!("{:.6} POL", pol), "inline": true },
-                    { "name": "Exchange ID", "value": &exchange.public_id, "inline": true }
-                ],
-                "footer": { "text": "Send USDC.e manually to the deposit address above to proceed" }
-            });
-            if let Err(e2) = send_discord_embed(embed).await {
-                eprintln!("Discord POL top-up fail embed failed: {e2:#}");
-            }
+            eprintln!("POL top-up USDC transfer failed: {e:#}");
         }
     }
 
@@ -2373,13 +2091,6 @@ async fn send_discord_embed(embed: Value) -> Result<()> {
     Ok(())
 }
 
-async fn notify_important(message: &str) -> Result<()> {
-    println!("{message}");
-    if let Err(e) = send_discord_webhook(message).await {
-        eprintln!("Discord webhook send failed: {e:#}");
-    }
-    Ok(())
-}
 
 
 
