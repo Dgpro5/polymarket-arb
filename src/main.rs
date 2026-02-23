@@ -1185,40 +1185,85 @@ struct TradeDetails {
 }
 
 /// Determine how many shares a FAK order actually filled.
-/// Polls the order status endpoint for the exact fill size.
-/// Result is always capped at `requested_shares` — the API may report
-/// aggregated or differently-scaled values.
+/// Polls the order status endpoint (with retries) for the exact fill size.
+/// Falls back to computing from `takingAmount` if the poll doesn't return data.
+/// NEVER blindly returns `requested_shares` — FAK fills can exceed or undershoot
+/// the requested amount depending on market price vs limit price.
 async fn determine_fill_shares(
     client: &Client,
     wallet: &Arc<TradingWallet>,
     res: &BatchOrderResult,
     requested_shares: u64,
+    order_price: f64,
 ) -> u64 {
     if !res.success {
         return 0;
     }
 
-    // If status is empty (FAK with zero fills), the order matched nothing.
-    // Some batch responses return success=true with empty status for unfilled FAK.
+    // If status is empty AND no order ID, the FAK matched nothing.
     if res.status.is_empty() && res.order_id.is_empty() {
         return 0;
     }
 
-    // Poll order status for exact fill size
+    // ── Try 1: Use takingAmount from batch response (shares received) ───
+    // takingAmount is the number of conditional tokens received (= shares for BUY).
+    if !res.taking_amount.is_empty() {
+        if let Ok(taking) = res.taking_amount.parse::<f64>() {
+            if taking > 0.0 {
+                let shares = taking.round() as u64;
+                eprintln!(
+                    "  fill source: takingAmount={} → {} shares (requested {})",
+                    res.taking_amount, shares, requested_shares
+                );
+                return shares;
+            }
+        }
+    }
+
+    // ── Try 2: Poll order status endpoint for size_matched (with retries) ───
     if !res.order_id.is_empty() {
-        if let Ok(status) = get_order_status(client, wallet, &res.order_id).await {
-            if let Ok(matched) = status.size_matched.parse::<f64>() {
-                let shares = matched.round() as u64;
-                if shares > 0 {
-                    // Cap at requested — API may report differently-scaled values
-                    return shares.min(requested_shares);
+        for poll_attempt in 0..3u32 {
+            if poll_attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            if let Ok(status) = get_order_status(client, wallet, &res.order_id).await {
+                eprintln!(
+                    "  poll {}: status={} size_matched={} original_size={}",
+                    poll_attempt + 1, status.status, status.size_matched, status.original_size
+                );
+                if let Ok(matched) = status.size_matched.parse::<f64>() {
+                    if matched > 0.0 {
+                        let shares = matched.round() as u64;
+                        return shares;
+                    }
                 }
             }
         }
     }
 
-    // Fallback: if status is MATCHED, assume fully filled
+    // ── Try 3: Compute from makingAmount (USDC spent) / order_price ────
+    // makingAmount is USDC spent; shares ≈ makingAmount / price_per_share.
+    if !res.making_amount.is_empty() && order_price > 0.0 {
+        if let Ok(making) = res.making_amount.parse::<f64>() {
+            if making > 0.0 {
+                let shares = (making / order_price).round() as u64;
+                eprintln!(
+                    "  fill source: makingAmount={} / price={:.4} → {} shares (requested {})",
+                    res.making_amount, order_price, shares, requested_shares
+                );
+                return shares;
+            }
+        }
+    }
+
+    // ── Last resort: status says MATCHED but we have no amount data ────
+    // Log a warning — this path should rarely trigger now that we have retries.
     if res.status.eq_ignore_ascii_case("MATCHED") {
+        eprintln!(
+            "  WARNING: status=MATCHED but no fill data available. Falling back to requested_shares={}. \
+             This may be inaccurate if market price differs from limit price.",
+            requested_shares
+        );
         return requested_shares;
     }
 
@@ -1254,20 +1299,48 @@ async fn execute_arbitrage_trade(
         .into());
     }
 
-    // ── Order book depth (REST) — only used for sizing, NOT pricing ─────
+    // ── Order book (REST) — used for BOTH sizing AND pricing ─────────────
+    // CRITICAL: Use the REST order book best-ask for order prices, NOT the
+    // websocket price.  The websocket ask can be stale.  With FAK orders the
+    // exchange fills by spending maker_amount at the best available price,
+    // so a stale high limit price causes oversized fills (e.g. 112 shares
+    // instead of 33).
     let up_book = get_order_book(&client, up_asset_id).await?;
     let up_depth = calculate_total_size(&up_book.asks)?;
     let down_book = get_order_book(&client, down_asset_id).await?;
     let down_depth = calculate_total_size(&down_book.asks)?;
 
+    // Take 50% of the thinner side's depth — smaller orders fill more reliably
     let liquidity_shares = (up_depth.min(down_depth) * 0.5).floor();
-    let cost_per_pair = up_ask + down_ask;
+
+    // Use REST best ask for pricing — this is the actual current book price.
+    let up_book_ask: f64 = up_book
+        .asks
+        .first()
+        .and_then(|l| l.price.parse().ok())
+        .unwrap_or(up_ask);
+    let down_book_ask: f64 = down_book
+        .asks
+        .first()
+        .and_then(|l| l.price.parse().ok())
+        .unwrap_or(down_ask);
+
+    // Round to tick size (0.01)
+    let up_order_price = (up_book_ask * 100.0).ceil() / 100.0;
+    let down_order_price = (down_book_ask * 100.0).ceil() / 100.0;
+
+    eprintln!(
+        "Pricing — WS ask: UP={:.4} DOWN={:.4} | Book ask: UP={:.4} DOWN={:.4} | Order price: UP={:.2}c DOWN={:.2}c",
+        up_ask, down_ask, up_book_ask, down_book_ask, up_order_price * 100.0, down_order_price * 100.0
+    );
+
+    let cost_per_pair = up_order_price + down_order_price;
     let available = balance - MIN_BALANCE_USDC;
     let affordable_shares = (available / cost_per_pair).floor();
     // Cap so the more expensive leg never exceeds half the available balance.
     // This ensures we always have enough left for the second leg even with
     // asymmetric prices (e.g. UP=56c, DOWN=15c).
-    let max_expensive_leg = up_ask.max(down_ask);
+    let max_expensive_leg = up_order_price.max(down_order_price);
     let half_balance_shares = (available / 2.0 / max_expensive_leg).floor();
     let buy_shares = liquidity_shares
         .min(affordable_shares)
@@ -1288,16 +1361,23 @@ async fn execute_arbitrage_trade(
     // ═══════════════════════════════════════════════════════════════════════
     //  PHASE 1: Pre-build & sign BOTH orders as FAK before sending.
     //  No network calls between the two signs — eliminates signing delay.
+    //  Uses REST book prices so maker_amount accurately reflects the cost.
     // ═══════════════════════════════════════════════════════════════════════
     let up_salt = now_ms() as u64;
     let down_salt = up_salt + 1;
 
+    eprintln!(
+        "Building orders — {} shares × UP {:.2}c + DOWN {:.2}c = {:.2}c/pair, est ${:.4}",
+        buy_shares, up_order_price * 100.0, down_order_price * 100.0,
+        cost_per_pair * 100.0, cost_per_pair * buy_shares as f64
+    );
+
     let up_order = build_order_request(
-        wallet, up_asset_id, buy_shares, up_ask, "BUY", fee_bps, up_salt, "FAK", 0,
+        wallet, up_asset_id, buy_shares, up_order_price, "BUY", fee_bps, up_salt, "FAK", 0,
     )
     .await?;
     let down_order = build_order_request(
-        wallet, down_asset_id, buy_shares, down_ask, "BUY", fee_bps, down_salt, "FAK", 0,
+        wallet, down_asset_id, buy_shares, down_order_price, "BUY", fee_bps, down_salt, "FAK", 0,
     )
     .await?;
 
@@ -1320,8 +1400,14 @@ async fn execute_arbitrage_trade(
     let down_res = &batch_results[1];
 
     eprintln!(
-        "Batch results — UP: success={} status={} | DOWN: success={} status={}",
-        up_res.success, up_res.status, down_res.success, down_res.status
+        "Batch results — UP: success={} status={} orderID={} takingAmt={} makingAmt={} err={}",
+        up_res.success, up_res.status, up_res.order_id,
+        up_res.taking_amount, up_res.making_amount, up_res.error_msg
+    );
+    eprintln!(
+        "Batch results — DOWN: success={} status={} orderID={} takingAmt={} makingAmt={} err={}",
+        down_res.success, down_res.status, down_res.order_id,
+        down_res.taking_amount, down_res.making_amount, down_res.error_msg
     );
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1332,8 +1418,8 @@ async fn execute_arbitrage_trade(
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let (up_filled, down_filled) = tokio::join!(
-        determine_fill_shares(&client, wallet, up_res, buy_shares),
-        determine_fill_shares(&client, wallet, down_res, buy_shares),
+        determine_fill_shares(&client, wallet, up_res, buy_shares, up_order_price),
+        determine_fill_shares(&client, wallet, down_res, buy_shares, down_order_price),
     );
 
     eprintln!(
@@ -1409,7 +1495,7 @@ async fn execute_arbitrage_trade(
     // ═══════════════════════════════════════════════════════════════════════
     //  SUCCESS: We have `matched` shares on both sides.
     // ═══════════════════════════════════════════════════════════════════════
-    let total_spent = (up_ask + down_ask) * matched as f64;
+    let total_spent = (up_order_price + down_order_price) * matched as f64;
     let balance_after = balance - total_spent;
 
     Ok((
@@ -2571,12 +2657,16 @@ async fn place_batch_orders(
         .await
         .context("place batch orders")?;
 
-    if !resp.status().is_success() {
-        let error_text = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("Batch order placement failed: {}", error_text));
+    let resp_status = resp.status();
+    let resp_body = resp.text().await.unwrap_or_default();
+
+    if !resp_status.is_success() {
+        return Err(anyhow!("Batch order placement failed ({}): {}", resp_status, resp_body));
     }
 
-    let results: Vec<BatchOrderResult> = resp.json().await.context("parse batch order response")?;
+    eprintln!("Batch raw response: {}", resp_body);
+    let results: Vec<BatchOrderResult> = serde_json::from_str(&resp_body)
+        .context("parse batch order response")?;
     Ok(results)
 }
 
