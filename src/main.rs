@@ -236,6 +236,9 @@ const POL_TOP_UP_USDC: f64 = 10.0;
 
 // Polymarket CTF Exchange on Polygon (non-neg-risk markets)
 const CTF_EXCHANGE_ADDRESS: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
+// ConditionalTokens (ERC-1155) contract — holds outcome tokens.
+// setApprovalForAll is required here so the CTF Exchange can transfer tokens for SELL orders.
+const CONDITIONAL_TOKENS_ADDRESS: &str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
 const CHAIN_ID: u64 = 137;
 // Zero address — any counterparty can fill the order
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
@@ -288,6 +291,9 @@ async fn run() -> Result<()> {
     ensure_allowance(&client, &wallet, CTF_EXCHANGE_ADDRESS)
         .await
         .context("ensure USDC allowance")?;
+    ensure_ctf_token_approval(&client, &wallet)
+        .await
+        .context("ensure ERC-1155 approval for sell orders")?;
     check_and_top_up_pol(&client, &wallet)
         .await
         .unwrap_or_else(|e| eprintln!("POL top-up check failed: {e:#}"));
@@ -388,7 +394,7 @@ async fn run() -> Result<()> {
         }
     });
 
-    // Background task: refresh USDC allowance every 5 minutes.
+    // Background task: refresh USDC + ERC-1155 allowances every 5 minutes.
     let allowance_task_wallet = Arc::clone(&wallet);
     let allowance_task_client = client.clone();
     tokio::spawn(async move {
@@ -403,7 +409,15 @@ async fn run() -> Result<()> {
             )
             .await
             {
-                eprintln!("WARN: periodic allowance check failed: {e:#}");
+                eprintln!("WARN: periodic USDC allowance check failed: {e:#}");
+            }
+            if let Err(e) = ensure_ctf_token_approval(
+                &allowance_task_client,
+                &*allowance_task_wallet,
+            )
+            .await
+            {
+                eprintln!("WARN: periodic ERC-1155 approval check failed: {e:#}");
             }
         }
     });
@@ -1172,6 +1186,8 @@ struct TradeDetails {
 
 /// Determine how many shares a FAK order actually filled.
 /// Polls the order status endpoint for the exact fill size.
+/// Result is always capped at `requested_shares` — the API may report
+/// aggregated or differently-scaled values.
 async fn determine_fill_shares(
     client: &Client,
     wallet: &Arc<TradingWallet>,
@@ -1182,13 +1198,20 @@ async fn determine_fill_shares(
         return 0;
     }
 
+    // If status is empty (FAK with zero fills), the order matched nothing.
+    // Some batch responses return success=true with empty status for unfilled FAK.
+    if res.status.is_empty() && res.order_id.is_empty() {
+        return 0;
+    }
+
     // Poll order status for exact fill size
     if !res.order_id.is_empty() {
         if let Ok(status) = get_order_status(client, wallet, &res.order_id).await {
             if let Ok(matched) = status.size_matched.parse::<f64>() {
                 let shares = matched.round() as u64;
                 if shares > 0 {
-                    return shares;
+                    // Cap at requested — API may report differently-scaled values
+                    return shares.min(requested_shares);
                 }
             }
         }
@@ -1913,6 +1936,200 @@ async fn ensure_allowance(client: &Client, wallet: &TradingWallet, spender: &str
 
     Err(anyhow!(
         "Approve tx not confirmed within 30s. Check Polygonscan: {tx_hash}"
+    ))
+}
+
+// ── ERC-1155 approval for ConditionalTokens (needed for SELL orders) ────────
+//
+// The CTF Exchange must call transferFrom on the ConditionalTokens (ERC-1155)
+// contract to settle SELL orders.  This requires setApprovalForAll(operator, true).
+
+/// isApprovedForAll(address,address) — selector 0xe985e9c5
+async fn is_approved_for_all(
+    client: &Client,
+    owner: &Address,
+    operator: &str,
+    contract: &str,
+) -> Result<bool> {
+    let ankr_key = env::var(ANKR_API_KEY_ENV)
+        .with_context(|| format!("Missing env var '{ANKR_API_KEY_ENV}'"))?;
+    let rpc_url = format!("https://rpc.ankr.com/polygon/{}", ankr_key.trim());
+
+    let owner_hex = format!("{:x}", owner);
+    let operator_hex = operator.trim_start_matches("0x");
+    let calldata = format!("e985e9c5{:0>64}{:0>64}", owner_hex, operator_hex);
+
+    let body = json!({
+        "jsonrpc": "2.0",
+        "method": "eth_call",
+        "params": [{"to": contract, "data": format!("0x{calldata}")}, "latest"],
+        "id": 1
+    });
+
+    let resp = client
+        .post(&rpc_url)
+        .json(&body)
+        .send()
+        .await
+        .context("eth_call isApprovedForAll")?;
+    let raw = resp.text().await.context("read isApprovedForAll response")?;
+    let parsed: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parse isApprovedForAll JSON: {raw}"))?;
+
+    if let Some(err) = parsed.get("error") {
+        return Err(anyhow!("isApprovedForAll error: {err}"));
+    }
+
+    let hex = parsed
+        .get("result")
+        .and_then(|v| v.as_str())
+        .unwrap_or("0x0")
+        .trim_start_matches("0x");
+    let val = u128::from_str_radix(hex, 16).unwrap_or(0);
+    Ok(val != 0)
+}
+
+/// Calls setApprovalForAll(CTF_EXCHANGE_ADDRESS, true) on the ConditionalTokens
+/// contract if not already approved.  This is required for SELL orders.
+async fn ensure_ctf_token_approval(client: &Client, wallet: &TradingWallet) -> Result<()> {
+    let approved = is_approved_for_all(
+        client,
+        &wallet.address,
+        CTF_EXCHANGE_ADDRESS,
+        CONDITIONAL_TOKENS_ADDRESS,
+    )
+    .await?;
+
+    if approved {
+        return Ok(());
+    }
+
+    eprintln!("ERC-1155 approval missing — sending setApprovalForAll tx...");
+
+    let ankr_key = env::var(ANKR_API_KEY_ENV)
+        .with_context(|| format!("Missing env var '{ANKR_API_KEY_ENV}'"))?;
+    let rpc_url = format!("https://rpc.ankr.com/polygon/{}", ankr_key.trim());
+
+    // Nonce
+    let nonce_body = json!({
+        "jsonrpc": "2.0", "method": "eth_getTransactionCount",
+        "params": [format!("{:#x}", wallet.address), "latest"], "id": 1
+    });
+    let nonce_resp: Value = client
+        .post(&rpc_url)
+        .json(&nonce_body)
+        .send()
+        .await
+        .context("get nonce for setApprovalForAll")?
+        .json()
+        .await?;
+    let nonce = nonce_resp["result"]
+        .as_str()
+        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .ok_or_else(|| anyhow!("bad nonce: {nonce_resp}"))?;
+
+    // Gas price
+    let gas_body = json!({"jsonrpc":"2.0","method":"eth_gasPrice","params":[],"id":1});
+    let gas_resp: Value = client
+        .post(&rpc_url)
+        .json(&gas_body)
+        .send()
+        .await
+        .context("get gas price")?
+        .json()
+        .await?;
+    let gas_price = gas_resp["result"]
+        .as_str()
+        .and_then(|s| u128::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .ok_or_else(|| anyhow!("could not parse gas price: {gas_resp}"))?;
+
+    // setApprovalForAll(address operator, bool approved) — selector 0xa22cb465
+    let operator_hex = CTF_EXCHANGE_ADDRESS.trim_start_matches("0x");
+    let calldata_hex = format!(
+        "a22cb465{:0>64}{:0>64}",
+        operator_hex,
+        "1" // true
+    );
+    let calldata_bytes = hex::decode(&calldata_hex).context("decode setApprovalForAll calldata")?;
+
+    use ethers::types::transaction::eip2718::TypedTransaction;
+    let tx = TypedTransaction::Legacy(ethers::types::TransactionRequest {
+        from: Some(wallet.address),
+        to: Some(
+            CONDITIONAL_TOKENS_ADDRESS
+                .parse::<Address>()
+                .unwrap()
+                .into(),
+        ),
+        nonce: Some(U256::from(nonce)),
+        gas: Some(U256::from(100_000u64)),
+        gas_price: Some(U256::from(gas_price * 3)),
+        data: Some(calldata_bytes.into()),
+        value: Some(U256::zero()),
+        chain_id: Some(U64::from(CHAIN_ID)),
+        ..Default::default()
+    });
+
+    let sig = wallet
+        .wallet
+        .sign_transaction(&tx)
+        .await
+        .map_err(|e| anyhow!("sign setApprovalForAll tx: {e}"))?;
+    let raw_tx = format!("0x{}", hex::encode(tx.rlp_signed(&sig)));
+
+    let send_body = json!({
+        "jsonrpc": "2.0", "method": "eth_sendRawTransaction",
+        "params": [raw_tx], "id": 1
+    });
+    let send_resp: Value = client
+        .post(&rpc_url)
+        .json(&send_body)
+        .send()
+        .await
+        .context("send setApprovalForAll tx")?
+        .json()
+        .await
+        .context("parse send response")?;
+
+    if let Some(err) = send_resp.get("error") {
+        return Err(anyhow!("setApprovalForAll tx failed: {err}"));
+    }
+
+    let tx_hash = send_resp["result"]
+        .as_str()
+        .ok_or_else(|| anyhow!("no tx hash in response: {send_resp}"))?;
+
+    // Poll for receipt (up to 30 seconds)
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let receipt_body = json!({
+            "jsonrpc": "2.0", "method": "eth_getTransactionReceipt",
+            "params": [tx_hash], "id": 1
+        });
+        let receipt: Value = client
+            .post(&rpc_url)
+            .json(&receipt_body)
+            .send()
+            .await
+            .context("get receipt")?
+            .json()
+            .await
+            .context("parse receipt")?;
+        if let Some(r) = receipt.get("result").filter(|v| !v.is_null()) {
+            let status = r["status"].as_str().unwrap_or("0x0");
+            if status == "0x1" {
+                eprintln!("ERC-1155 approval set successfully: {tx_hash}");
+                return Ok(());
+            } else {
+                return Err(anyhow!(
+                    "setApprovalForAll tx reverted. Check wallet has MATIC for gas."
+                ));
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "setApprovalForAll tx not confirmed within 30s. Check Polygonscan: {tx_hash}"
     ))
 }
 
