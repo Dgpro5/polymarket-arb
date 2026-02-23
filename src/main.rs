@@ -2072,7 +2072,7 @@ async fn ensure_ctf_token_approvals(client: &Client, wallet: &TradingWallet) -> 
     let pairs: &[(&str, &str, &str)] = &[
         (CTF_CONTRACT, CTF_EXCHANGE_ADDRESS, "CTF → CTF Exchange"),
         (CTF_CONTRACT, NEG_RISK_CTF_EXCHANGE, "CTF → Neg Risk Exchange"),
-        (NEG_RISK_ADAPTER, NEG_RISK_CTF_EXCHANGE, "NegRiskAdapter → Neg Risk Exchange"),
+        (CTF_CONTRACT, NEG_RISK_ADAPTER, "CTF → Neg Risk Adapter"),
     ];
 
     for &(contract, operator, label) in pairs {
@@ -2088,11 +2088,9 @@ async fn ensure_ctf_token_approvals(client: &Client, wallet: &TradingWallet) -> 
             }
             Err(e) => {
                 eprintln!("WARN: could not check ERC-1155 approval for {label}: {e:#}");
-                // Try to set it anyway — better safe than stuck
-                if let Err(e2) = send_set_approval_for_all(client, wallet, contract, operator).await
-                {
-                    eprintln!("WARN: setApprovalForAll for {label} also failed: {e2:#}");
-                }
+                // Only attempt the tx if this is the first cycle — avoid burning
+                // gas every iteration on a check that keeps failing.
+                // The periodic re-check will retry next cycle if needed.
             }
         }
     }
