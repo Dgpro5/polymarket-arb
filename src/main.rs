@@ -55,6 +55,34 @@ static LAST_DETECTION_MS: AtomicI64 = AtomicI64::new(0);
 /// `false` = idle, `true` = trade in progress.
 static TRADE_IN_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// RAII guard that resets `TRADE_IN_PROGRESS` to `false` when dropped.
+/// This ensures the lock is released even if the async future is cancelled
+/// (e.g. by `tokio::select!`) or if a panic occurs during trade execution.
+struct TradeGuard;
+
+impl TradeGuard {
+    /// Attempts to acquire the trade lock.
+    /// Returns `Some(TradeGuard)` if the lock was idle, `None` if a trade is
+    /// already in progress.
+    fn acquire() -> Option<Self> {
+        TRADE_IN_PROGRESS
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .ok()
+            .map(|_| TradeGuard)
+    }
+}
+
+impl Drop for TradeGuard {
+    fn drop(&mut self) {
+        TRADE_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Candle {
     start_ms: i64,
@@ -469,6 +497,11 @@ async fn run() -> Result<()> {
                         state.lock().await.fee_bps = fee_bps;
                     }
                 }
+
+                // Reset trade lock at the start of each window.  If the previous
+                // window was cancelled by select! mid-trade, the TradeGuard's Drop
+                // already cleared this — but an explicit reset here is a safety net.
+                TRADE_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
 
                 let mut window_closed = false;
                 let mut close_reason = "unknown";
@@ -1000,23 +1033,18 @@ async fn print_up_down(
 
             // ── Trade lock gate ──────────────────────────────────────
             // Prevents a second trade from starting while one is in flight.
-            // compare_exchange: only proceed if currently false (idle).
-            if TRADE_IN_PROGRESS
-                .compare_exchange(
-                    false,
-                    true,
-                    std::sync::atomic::Ordering::SeqCst,
-                    std::sync::atomic::Ordering::SeqCst,
-                )
-                .is_err()
-            {
-                eprintln!("Trade already in progress — skipping this opportunity");
-                return Ok(());
-            }
+            // TradeGuard uses RAII to guarantee the lock is released even if
+            // the future is cancelled by tokio::select! or a panic occurs.
+            let _trade_guard = match TradeGuard::acquire() {
+                Some(guard) => guard,
+                None => {
+                    eprintln!("Trade already in progress — skipping this opportunity");
+                    return Ok(());
+                }
+            };
 
             LAST_DETECTION_MS.store(now, Ordering::Relaxed);
 
-            // Ensure the lock is always released, even on early returns/panics.
             // Use WebSocket best-ask prices for orders (low latency).
             // Round to tick size, fall back to midpoint if ask unavailable.
             let up_ask_price = ((up_ask.unwrap_or(up) * 100.0).round()) / 100.0;
@@ -1036,7 +1064,7 @@ async fn print_up_down(
 
             // Update cooldown AFTER trade completes so the 5s window starts from trade end.
             LAST_DETECTION_MS.store(now_ms(), Ordering::Relaxed);
-            TRADE_IN_PROGRESS.store(false, Ordering::SeqCst);
+            // Lock is released automatically when _trade_guard is dropped.
 
             match trade_result {
                 Ok((trade_result, details)) => {
