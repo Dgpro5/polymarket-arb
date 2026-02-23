@@ -1295,94 +1295,127 @@ async fn execute_arbitrage_trade(
         ));
     }
 
-    // ── Re-fetch fee rate before second order ───────────────────────────
-    let second_fee_bps = get_fee_rate(&client, second_id)
-        .await
-        .unwrap_or(fee_bps);
+    // ── LEG 2: thicker side — try up to 3 times with fresh order book ──
+    //
+    // Each attempt re-fetches the order book so we use the *actual* current
+    // best ask rather than a stale price that already failed.  We also verify
+    // the pair still makes sense (sum <= $1.02 — max 2% overpay, since we are
+    // already committed to the first leg and selling back costs more).
+    const LEG2_MAX_ATTEMPTS: usize = 3;
+    const LEG2_MAX_SUM: f64 = 1.02; // give up if pair costs > $1.02
+    let leg2_delays_ms: [u64; 3] = [0, 200, 500];
+    let mut leg2_errors: Vec<String> = Vec::new();
 
-    // ── LEG 2: thicker side ─────────────────────────────────────────────
-    let second_salt = now_ms() as u64 + 1;
-    let second_order = build_order_request(
-        wallet, second_id, buy_shares, second_ask, "BUY", second_fee_bps, second_salt,
-    )
-    .await?;
-    let second_res = place_single_order(&client, wallet, second_order).await;
-
-    if let Ok(ref r) = second_res {
-        if r.success && r.status.eq_ignore_ascii_case("MATCHED") {
-            let balance_after = balance - estimated_cost;
-            // Map first/second back to up/down for TradeDetails
-            let (up_oid, up_st, down_oid, down_st, up_fee, down_fee) =
-                if first_label == "UP" {
-                    (first_res.order_id.clone(), first_res.status.clone(),
-                     r.order_id.clone(), r.status.clone(), fee_bps, second_fee_bps)
-                } else {
-                    (r.order_id.clone(), r.status.clone(),
-                     first_res.order_id.clone(), first_res.status.clone(), second_fee_bps, fee_bps)
-                };
-            return Ok((
-                TradeResult { shares_bought: buy_shares, total_spent: estimated_cost },
-                TradeDetails {
-                    balance_before: balance, balance_after,
-                    up_order_id: up_oid, up_status: up_st,
-                    down_order_id: down_oid, down_status: down_st,
-                    up_fee_bps: up_fee, down_fee_bps: down_fee,
-                    up_depth, down_depth, down_retried: false,
-                },
-            ));
+    for attempt in 0..LEG2_MAX_ATTEMPTS {
+        if leg2_delays_ms[attempt] > 0 {
+            eprintln!(
+                "{} attempt {} failed — retrying in {}ms with fresh book…",
+                second_label,
+                attempt,
+                leg2_delays_ms[attempt]
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(leg2_delays_ms[attempt])).await;
         }
+
+        // Re-fetch fee rate
+        let attempt_fee = get_fee_rate(&client, second_id)
+            .await
+            .unwrap_or(fee_bps);
+
+        // Re-fetch order book for fresh best ask price
+        let fresh_ask = match get_order_book(&client, second_id).await {
+            Ok(book) => {
+                if book.asks.is_empty() {
+                    let e = format!("attempt {}: no asks in order book", attempt + 1);
+                    eprintln!("{} {}", second_label, e);
+                    leg2_errors.push(e);
+                    continue;
+                }
+                match book.asks[0].price.parse::<f64>() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        let e = format!("attempt {}: bad ask price '{}'", attempt + 1, book.asks[0].price);
+                        leg2_errors.push(e);
+                        continue;
+                    }
+                }
+            }
+            Err(e) => {
+                let msg = format!("attempt {}: order book fetch failed: {:#}", attempt + 1, e);
+                eprintln!("{} {}", second_label, msg);
+                leg2_errors.push(msg);
+                continue;
+            }
+        };
+
+        // Sanity check: is completing the pair still better than selling back?
+        let pair_sum = first_ask + fresh_ask;
+        if pair_sum > LEG2_MAX_SUM {
+            let e = format!(
+                "attempt {}: pair too expensive ({:.2}c + {:.2}c = {:.2}c > {:.0}c cap)",
+                attempt + 1,
+                first_ask * 100.0,
+                fresh_ask * 100.0,
+                pair_sum * 100.0,
+                LEG2_MAX_SUM * 100.0,
+            );
+            eprintln!("{} {}", second_label, e);
+            leg2_errors.push(e);
+            break; // price moved against us, sell back instead
+        }
+
+        let attempt_salt = now_ms() as u64 + (attempt as u64) + 1;
+        let attempt_order = match build_order_request(
+            wallet, second_id, buy_shares, fresh_ask, "BUY", attempt_fee, attempt_salt,
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                let msg = format!("attempt {}: build order failed: {:#}", attempt + 1, e);
+                leg2_errors.push(msg);
+                continue;
+            }
+        };
+        let attempt_res = place_single_order(&client, wallet, attempt_order).await;
+
+        if let Ok(ref r) = attempt_res {
+            if r.success && r.status.eq_ignore_ascii_case("MATCHED") {
+                let actual_cost = (first_ask + fresh_ask) * (buy_shares as f64);
+                let balance_after = balance - actual_cost;
+                let (up_oid, up_st, down_oid, down_st, up_fee, down_fee) =
+                    if first_label == "UP" {
+                        (first_res.order_id.clone(), first_res.status.clone(),
+                         r.order_id.clone(), r.status.clone(), fee_bps, attempt_fee)
+                    } else {
+                        (r.order_id.clone(), r.status.clone(),
+                         first_res.order_id.clone(), first_res.status.clone(), attempt_fee, fee_bps)
+                    };
+                return Ok((
+                    TradeResult { shares_bought: buy_shares, total_spent: actual_cost },
+                    TradeDetails {
+                        balance_before: balance, balance_after,
+                        up_order_id: up_oid, up_status: up_st,
+                        down_order_id: down_oid, down_status: down_st,
+                        up_fee_bps: up_fee, down_fee_bps: down_fee,
+                        up_depth, down_depth, down_retried: attempt > 0,
+                    },
+                ));
+            }
+        }
+
+        let err_msg = match &attempt_res {
+            Ok(r) => r.error_msg.clone(),
+            Err(e) => format!("{:#}", e),
+        };
+        leg2_errors.push(format!("attempt {}: {}", attempt + 1, err_msg));
     }
 
-    // ── LEG 2 failed — retry once ───────────────────────────────────────
-    let err_1 = match &second_res {
-        Ok(r) => r.error_msg.clone(),
-        Err(e) => format!("{:#}", e),
-    };
-    eprintln!("{} failed: {} | Retrying in 150ms...", second_label, err_1);
-    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
-
-    let retry_fee = get_fee_rate(&client, second_id)
-        .await
-        .unwrap_or(second_fee_bps);
-    let retry_salt = now_ms() as u64 + 50;
-    let retry_order = build_order_request(
-        wallet, second_id, buy_shares, second_ask, "BUY", retry_fee, retry_salt,
-    )
-    .await?;
-    let retry_res = place_single_order(&client, wallet, retry_order).await;
-
-    if let Ok(ref r) = retry_res {
-        if r.success && r.status.eq_ignore_ascii_case("MATCHED") {
-            let balance_after = balance - estimated_cost;
-            let (up_oid, up_st, down_oid, down_st, up_fee, down_fee) =
-                if first_label == "UP" {
-                    (first_res.order_id.clone(), first_res.status.clone(),
-                     r.order_id.clone(), r.status.clone(), fee_bps, retry_fee)
-                } else {
-                    (r.order_id.clone(), r.status.clone(),
-                     first_res.order_id.clone(), first_res.status.clone(), retry_fee, fee_bps)
-                };
-            return Ok((
-                TradeResult { shares_bought: buy_shares, total_spent: estimated_cost },
-                TradeDetails {
-                    balance_before: balance, balance_after,
-                    up_order_id: up_oid, up_status: up_st,
-                    down_order_id: down_oid, down_status: down_st,
-                    up_fee_bps: up_fee, down_fee_bps: down_fee,
-                    up_depth, down_depth, down_retried: true,
-                },
-            ));
-        }
-    }
-
-    // ── LEG 2 failed twice — LEG 1 is filled, must sell back ────────────
-    let err_2 = match &retry_res {
-        Ok(r) => r.error_msg.clone(),
-        Err(e) => format!("{:#}", e),
-    };
+    // ── All LEG 2 attempts failed — must sell back LEG 1 ────────────────
+    let all_errors = leg2_errors.join(" | ");
     eprintln!(
-        "{} failed twice: 1st={} | 2nd={} | Selling back {} {} shares to unwind",
-        second_label, err_1, err_2, buy_shares, first_label
+        "{} failed {} times: {} | Selling back {} {} shares to unwind",
+        second_label, leg2_errors.len(), all_errors, buy_shares, first_label
     );
 
     // Retry sell-back up to 3 times with increasing delay.
@@ -1401,8 +1434,8 @@ async fn execute_arbitrage_trade(
         match sell_back_shares(&client, wallet, first_id, buy_shares, fee_bps).await {
             Ok(sell_order_id) => {
                 let msg = format!(
-                    "{} failed twice (1st: {} | 2nd: {}). Sold {} {} shares back (order {}, attempt {}). No net position.",
-                    second_label, err_1, err_2, buy_shares, first_label, sell_order_id, attempt + 1
+                    "{} failed ({}). Sold {} {} shares back (order {}, attempt {}). No net position.",
+                    second_label, all_errors, buy_shares, first_label, sell_order_id, attempt + 1
                 );
                 eprintln!("{}", msg);
                 let _ = send_discord_webhook(&msg).await;
@@ -1418,7 +1451,7 @@ async fn execute_arbitrage_trade(
     let msg = format!(
         "CRITICAL: {} {} filled {} shares, {} failed ({}), SELL-BACK FAILED 3 TIMES: {}. \
          UNBALANCED POSITION — manual intervention required!",
-        first_label, first_res.order_id, buy_shares, second_label, err_2, last_sell_err
+        first_label, first_res.order_id, buy_shares, second_label, all_errors, last_sell_err
     );
     eprintln!("{}", msg);
     let _ = send_discord_webhook(&msg).await;
