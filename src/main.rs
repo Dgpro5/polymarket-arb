@@ -5,7 +5,6 @@ use anyhow::{Context, Error, Result, anyhow};
 use base64::{Engine, engine::general_purpose::URL_SAFE as BASE64};
 use ethers::prelude::*;
 use ethers::signers::{LocalWallet, Signer};
-use ethers::utils::keccak256;
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use polymarket_client_sdk::POLYGON;
@@ -48,7 +47,7 @@ const PRIVATE_KEY_ENV: &str = "PRIVATE_KEY";
 // Formula: sum_cents < 100.0 / (1.0 + fee_bps / 10000.0)
 // This constant is a hard fallback only used if the fee fetch fails.
 const MIN_PROFIT_THRESHOLD_FALLBACK: f64 = 90.0;
-const SLIPPAGE_TOLERANCE: f64 = 0.02; // 2% slippage tolerance
+// Sell-back uses progressive slippage: 3% → 8% → 15% across retries (see sell_back_shares).
 
 static LAST_DETECTION_MS: AtomicI64 = AtomicI64::new(0);
 /// Global trade lock — prevents a second trade from starting while one is in flight.
@@ -145,6 +144,7 @@ struct OrderBook {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct BatchOrderResult {
     success: bool,
     #[serde(rename = "orderID", default)]
@@ -153,6 +153,24 @@ struct BatchOrderResult {
     status: String,
     #[serde(rename = "errorMsg", default)]
     error_msg: String,
+    #[serde(rename = "takingAmount", default)]
+    taking_amount: String,
+    #[serde(rename = "makingAmount", default)]
+    making_amount: String,
+}
+
+/// Response from GET /data/order/{order_hash} — used to poll fill status.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct OpenOrder {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    original_size: String,
+    #[serde(default)]
+    size_matched: String,
 }
 
 // Order inner object — field names and types match Polymarket's documented payload exactly
@@ -183,6 +201,7 @@ struct PolymarketOrderStruct {
 
 // SimpleSwap exchange object returned by POST /v3/exchanges
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct SimpleSwapExchange {
     #[serde(rename = "publicId")]
     public_id: String,
@@ -1046,26 +1065,33 @@ async fn print_up_down(
                     money.total_shares_bought += (trade_result.shares_bought * 2) as i64;
 
                     let edge = 100.0 - sum_cents;
-                    let retry_note = if details.down_retried {
-                        " (retried)"
+                    let fill_note = if details.up_filled == details.requested_shares
+                        && details.down_filled == details.requested_shares
+                    {
+                        "full".to_string()
                     } else {
-                        ""
+                        format!(
+                            "partial — UP {}/{}, DOWN {}/{}",
+                            details.up_filled, details.requested_shares,
+                            details.down_filled, details.requested_shares
+                        )
                     };
                     let embed = json!({
-                        "title": "Trade Executed",
+                        "title": "Trade Executed (Batch FAK)",
                         "color": 0x2ECC71,
                         "fields": [
                             { "name": "UP Price", "value": format!("{:.2}c", up * 100.0), "inline": true },
                             { "name": "DOWN Price", "value": format!("{:.2}c", down * 100.0), "inline": true },
                             { "name": "Sum / Edge", "value": format!("{:.2}c / +{:.2}c", sum_cents, edge), "inline": true },
-                            { "name": "Shares (each side)", "value": format!("{}", trade_result.shares_bought), "inline": true },
+                            { "name": "Matched Shares", "value": format!("{}", trade_result.shares_bought), "inline": true },
                             { "name": "Total Spent", "value": format!("${:.4}", trade_result.total_spent), "inline": true },
+                            { "name": "Fill", "value": fill_note, "inline": true },
                             { "name": "Fee (UP/DOWN)", "value": format!("{}bps / {}bps", details.up_fee_bps, details.down_fee_bps), "inline": true },
                             { "name": "Balance Before", "value": format!("${:.4}", details.balance_before), "inline": true },
                             { "name": "Balance After", "value": format!("${:.4}", details.balance_after), "inline": true },
                             { "name": "Window Trades", "value": format!("{}", money.total_buy_positions), "inline": true },
                             { "name": "UP Order", "value": format!("`{}` ({})", details.up_order_id, details.up_status), "inline": false },
-                            { "name": "DOWN Order", "value": format!("`{}`{} ({})", details.down_order_id, retry_note, details.down_status), "inline": false },
+                            { "name": "DOWN Order", "value": format!("`{}` ({})", details.down_order_id, details.down_status), "inline": false },
                             { "name": "Book Depth (UP/DOWN)", "value": format!("{:.0} / {:.0}", details.up_depth, details.down_depth), "inline": true },
                             { "name": "UP Asset", "value": format!("`{}`", up_asset), "inline": false },
                             { "name": "DOWN Asset", "value": format!("`{}`", down_asset), "inline": false }
@@ -1139,12 +1165,47 @@ struct TradeDetails {
     down_fee_bps: u64,
     up_depth: f64,
     down_depth: f64,
-    down_retried: bool,
+    requested_shares: u64,
+    up_filled: u64,
+    down_filled: u64,
 }
 
-/// Places UP and DOWN orders as completely separate operations.
-/// Between the two orders: re-fetches fee rate so each order uses fresh data.
-/// Returns (TradeResult, TradeDetails) on success.
+/// Determine how many shares a FAK order actually filled.
+/// Polls the order status endpoint for the exact fill size.
+async fn determine_fill_shares(
+    client: &Client,
+    wallet: &Arc<TradingWallet>,
+    res: &BatchOrderResult,
+    requested_shares: u64,
+) -> u64 {
+    if !res.success {
+        return 0;
+    }
+
+    // Poll order status for exact fill size
+    if !res.order_id.is_empty() {
+        if let Ok(status) = get_order_status(client, wallet, &res.order_id).await {
+            if let Ok(matched) = status.size_matched.parse::<f64>() {
+                let shares = matched.round() as u64;
+                if shares > 0 {
+                    return shares;
+                }
+            }
+        }
+    }
+
+    // Fallback: if status is MATCHED, assume fully filled
+    if res.status.eq_ignore_ascii_case("MATCHED") {
+        return requested_shares;
+    }
+
+    0
+}
+
+/// Places UP and DOWN orders simultaneously via batch FAK submission.
+/// Both orders are pre-built and signed, then submitted in a single HTTP
+/// request to minimize the timing gap.  FAK allows partial fills — any
+/// mismatch between legs is resolved by selling back the excess.
 async fn execute_arbitrage_trade(
     wallet: &Arc<TradingWallet>,
     up_asset_id: &str,
@@ -1176,7 +1237,7 @@ async fn execute_arbitrage_trade(
     let down_book = get_order_book(&client, down_asset_id).await?;
     let down_depth = calculate_total_size(&down_book.asks)?;
 
-    let liquidity_shares = (up_depth.min(down_depth) * 0.8).floor();
+    let liquidity_shares = (up_depth.min(down_depth) * 0.5).floor();
     let cost_per_pair = up_ask + down_ask;
     let available = balance - MIN_BALANCE_USDC;
     let affordable_shares = (available / cost_per_pair).floor();
@@ -1201,162 +1262,160 @@ async fn execute_arbitrage_trade(
         ));
     }
 
-    let estimated_cost = cost_per_pair * (buy_shares as f64);
-
     // ═══════════════════════════════════════════════════════════════════════
-    //  Place the THINNER side first.  If it gets killed we haven't committed
-    //  any capital, so there's nothing to unwind.  The thicker side placed
-    //  second is more likely to fill.
+    //  PHASE 1: Pre-build & sign BOTH orders as FAK before sending.
+    //  No network calls between the two signs — eliminates signing delay.
     // ═══════════════════════════════════════════════════════════════════════
-    let (first_id, first_ask, first_label,
-         second_id, second_ask, second_label) =
-        if up_depth <= down_depth {
-            (up_asset_id, up_ask, "UP",
-             down_asset_id, down_ask, "DOWN")
-        } else {
-            (down_asset_id, down_ask, "DOWN",
-             up_asset_id, up_ask, "UP")
-        };
+    let up_salt = now_ms() as u64;
+    let down_salt = up_salt + 1;
 
-    // ── LEG 1: thinner side ─────────────────────────────────────────────
-    let first_salt = now_ms() as u64;
-    let first_order = build_order_request(
-        wallet, first_id, buy_shares, first_ask, "BUY", fee_bps, first_salt,
+    let up_order = build_order_request(
+        wallet, up_asset_id, buy_shares, up_ask, "BUY", fee_bps, up_salt, "FAK", 0,
     )
     .await?;
-    let first_res = place_single_order(&client, wallet, first_order)
-        .await
-        .with_context(|| format!("{} order request failed", first_label))?;
+    let down_order = build_order_request(
+        wallet, down_asset_id, buy_shares, down_ask, "BUY", fee_bps, down_salt, "FAK", 0,
+    )
+    .await?;
 
-    if !first_res.success {
-        return Err(anyhow!("{} rejected: {}", first_label, first_res.error_msg));
-    }
-    if !first_res.status.eq_ignore_ascii_case("MATCHED") {
-        let _ = cancel_order(&client, wallet, &first_res.order_id).await;
+    // ═══════════════════════════════════════════════════════════════════════
+    //  PHASE 2: Submit BOTH in a single batch request.
+    //  Both hit the matching engine in one HTTP call — microseconds apart.
+    // ═══════════════════════════════════════════════════════════════════════
+    let batch_results = place_batch_orders(&client, wallet, vec![up_order, down_order])
+        .await
+        .context("batch order submission failed")?;
+
+    if batch_results.len() < 2 {
         return Err(anyhow!(
-            "{} order not fully filled (status={}). Cancelled {}.",
-            first_label, first_res.status, first_res.order_id
+            "Batch returned {} results (expected 2)",
+            batch_results.len()
         ));
     }
 
-    // ── Re-fetch fee rate before second order ───────────────────────────
-    let second_fee_bps = get_fee_rate(&client, second_id)
-        .await
-        .unwrap_or(fee_bps);
+    let up_res = &batch_results[0];
+    let down_res = &batch_results[1];
 
-    // ── LEG 2: thicker side ─────────────────────────────────────────────
-    let second_salt = now_ms() as u64 + 1;
-    let second_order = build_order_request(
-        wallet, second_id, buy_shares, second_ask, "BUY", second_fee_bps, second_salt,
-    )
-    .await?;
-    let second_res = place_single_order(&client, wallet, second_order).await;
-
-    if let Ok(ref r) = second_res {
-        if r.success && r.status.eq_ignore_ascii_case("MATCHED") {
-            let balance_after = balance - estimated_cost;
-            // Map first/second back to up/down for TradeDetails
-            let (up_oid, up_st, down_oid, down_st, up_fee, down_fee) =
-                if first_label == "UP" {
-                    (first_res.order_id.clone(), first_res.status.clone(),
-                     r.order_id.clone(), r.status.clone(), fee_bps, second_fee_bps)
-                } else {
-                    (r.order_id.clone(), r.status.clone(),
-                     first_res.order_id.clone(), first_res.status.clone(), second_fee_bps, fee_bps)
-                };
-            return Ok((
-                TradeResult { shares_bought: buy_shares, total_spent: estimated_cost },
-                TradeDetails {
-                    balance_before: balance, balance_after,
-                    up_order_id: up_oid, up_status: up_st,
-                    down_order_id: down_oid, down_status: down_st,
-                    up_fee_bps: up_fee, down_fee_bps: down_fee,
-                    up_depth, down_depth, down_retried: false,
-                },
-            ));
-        }
-    }
-
-    // ── LEG 2 failed — retry once ───────────────────────────────────────
-    let err_1 = match &second_res {
-        Ok(r) => r.error_msg.clone(),
-        Err(e) => format!("{:#}", e),
-    };
-    eprintln!("{} failed: {} | Retrying in 150ms...", second_label, err_1);
-    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
-
-    let retry_fee = get_fee_rate(&client, second_id)
-        .await
-        .unwrap_or(second_fee_bps);
-    let retry_salt = now_ms() as u64 + 50;
-    let retry_order = build_order_request(
-        wallet, second_id, buy_shares, second_ask, "BUY", retry_fee, retry_salt,
-    )
-    .await?;
-    let retry_res = place_single_order(&client, wallet, retry_order).await;
-
-    if let Ok(ref r) = retry_res {
-        if r.success && r.status.eq_ignore_ascii_case("MATCHED") {
-            let balance_after = balance - estimated_cost;
-            let (up_oid, up_st, down_oid, down_st, up_fee, down_fee) =
-                if first_label == "UP" {
-                    (first_res.order_id.clone(), first_res.status.clone(),
-                     r.order_id.clone(), r.status.clone(), fee_bps, retry_fee)
-                } else {
-                    (r.order_id.clone(), r.status.clone(),
-                     first_res.order_id.clone(), first_res.status.clone(), retry_fee, fee_bps)
-                };
-            return Ok((
-                TradeResult { shares_bought: buy_shares, total_spent: estimated_cost },
-                TradeDetails {
-                    balance_before: balance, balance_after,
-                    up_order_id: up_oid, up_status: up_st,
-                    down_order_id: down_oid, down_status: down_st,
-                    up_fee_bps: up_fee, down_fee_bps: down_fee,
-                    up_depth, down_depth, down_retried: true,
-                },
-            ));
-        }
-    }
-
-    // ── LEG 2 failed twice — LEG 1 is filled, must sell back ────────────
-    let err_2 = match &retry_res {
-        Ok(r) => r.error_msg.clone(),
-        Err(e) => format!("{:#}", e),
-    };
     eprintln!(
-        "{} failed twice: 1st={} | 2nd={} | Selling back {} {} shares to unwind",
-        second_label, err_1, err_2, buy_shares, first_label
+        "Batch results — UP: success={} status={} | DOWN: success={} status={}",
+        up_res.success, up_res.status, down_res.success, down_res.status
     );
 
-    let sell_result = sell_back_shares(&client, wallet, first_id, buy_shares, fee_bps).await;
+    // ═══════════════════════════════════════════════════════════════════════
+    //  PHASE 3: Determine actual fill sizes for both legs.
+    //  FAK can partially fill — we need exact numbers.
+    //  Wait briefly for matching engine to finalize, then poll both in parallel.
+    // ═══════════════════════════════════════════════════════════════════════
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
-    match sell_result {
-        Ok(sell_order_id) => {
-            let msg = format!(
-                "{} failed twice (1st: {} | 2nd: {}). Sold {} {} shares back (order {}). No net position.",
-                second_label, err_1, err_2, buy_shares, first_label, sell_order_id
-            );
-            eprintln!("{}", msg);
-            let _ = send_discord_webhook(&msg).await;
-            Err(anyhow!("{}", msg))
-        }
-        Err(sell_err) => {
-            let msg = format!(
-                "CRITICAL: {} {} filled {} shares, {} failed ({}), SELL-BACK ALSO FAILED: {:#}. \
-                 UNBALANCED POSITION — manual intervention required!",
-                first_label, first_res.order_id, buy_shares, second_label, err_2, sell_err
-            );
-            eprintln!("{}", msg);
-            let _ = send_discord_webhook(&msg).await;
-            Err(anyhow!("{}", msg))
+    let (up_filled, down_filled) = tokio::join!(
+        determine_fill_shares(&client, wallet, up_res, buy_shares),
+        determine_fill_shares(&client, wallet, down_res, buy_shares),
+    );
+
+    eprintln!(
+        "Fill results — UP: {}/{} shares | DOWN: {}/{} shares",
+        up_filled, buy_shares, down_filled, buy_shares
+    );
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  PHASE 4: Handle results — sell back excess if mismatched.
+    // ═══════════════════════════════════════════════════════════════════════
+    let matched = up_filled.min(down_filled);
+
+    // Both legs got nothing — no capital committed
+    if matched == 0 && up_filled == 0 && down_filled == 0 {
+        return Err(anyhow!(
+            "Both FAK orders unfilled. UP: {} | DOWN: {}",
+            up_res.error_msg,
+            down_res.error_msg
+        ));
+    }
+
+    // Sell back excess on whichever side filled more
+    let excess_up = up_filled.saturating_sub(matched);
+    let excess_down = down_filled.saturating_sub(matched);
+
+    if excess_up > 0 {
+        eprintln!("Mismatch: selling back {} excess UP shares", excess_up);
+        match sell_back_shares(&client, wallet, up_asset_id, excess_up, fee_bps).await {
+            Ok(oid) => {
+                let msg = format!("Sold back {} excess UP shares (order {})", excess_up, oid);
+                eprintln!("{}", msg);
+                let _ = send_discord_webhook(&msg).await;
+            }
+            Err(e) => {
+                let msg = format!(
+                    "CRITICAL: {} excess UP shares could not be sold back: {:#}. UNBALANCED.",
+                    excess_up, e
+                );
+                eprintln!("{}", msg);
+                let _ = send_discord_webhook(&msg).await;
+            }
         }
     }
+
+    if excess_down > 0 {
+        eprintln!("Mismatch: selling back {} excess DOWN shares", excess_down);
+        match sell_back_shares(&client, wallet, down_asset_id, excess_down, fee_bps).await {
+            Ok(oid) => {
+                let msg = format!("Sold back {} excess DOWN shares (order {})", excess_down, oid);
+                eprintln!("{}", msg);
+                let _ = send_discord_webhook(&msg).await;
+            }
+            Err(e) => {
+                let msg = format!(
+                    "CRITICAL: {} excess DOWN shares could not be sold back: {:#}. UNBALANCED.",
+                    excess_down, e
+                );
+                eprintln!("{}", msg);
+                let _ = send_discord_webhook(&msg).await;
+            }
+        }
+    }
+
+    // If one leg filled but the other got nothing — sell-back was already attempted above
+    if matched == 0 {
+        return Err(anyhow!(
+            "One-sided fill (UP={}, DOWN={}). Sell-back attempted for excess.",
+            up_filled,
+            down_filled
+        ));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  SUCCESS: We have `matched` shares on both sides.
+    // ═══════════════════════════════════════════════════════════════════════
+    let total_spent = (up_ask + down_ask) * matched as f64;
+    let balance_after = balance - total_spent;
+
+    Ok((
+        TradeResult {
+            shares_bought: matched,
+            total_spent,
+        },
+        TradeDetails {
+            balance_before: balance,
+            balance_after,
+            up_order_id: up_res.order_id.clone(),
+            up_status: up_res.status.clone(),
+            down_order_id: down_res.order_id.clone(),
+            down_status: down_res.status.clone(),
+            up_fee_bps: fee_bps,
+            down_fee_bps: fee_bps,
+            up_depth,
+            down_depth,
+            requested_shares: buy_shares,
+            up_filled,
+            down_filled,
+        },
+    ))
 }
 
-/// Sell back shares that were bought on one side when the other side failed.
-/// Uses a FOK SELL order at the best bid price (with slippage tolerance)
-/// to immediately liquidate the position.
+/// Sell back shares with guaranteed recovery.
+/// Uses a 2-second settlement delay, then GTD sell orders with progressive
+/// pricing across 3 attempts.  Each attempt rests on the book for up to 15s
+/// to catch incoming bid liquidity.
 async fn sell_back_shares(
     client: &Client,
     wallet: &Arc<TradingWallet>,
@@ -1364,53 +1423,144 @@ async fn sell_back_shares(
     shares: u64,
     fee_bps: u64,
 ) -> Result<String> {
-    // Get current order book to find best bid
-    let book = get_order_book(client, asset_id)
-        .await
-        .context("fetch order book for sell-back")?;
-
-    if book.bids.is_empty() {
-        return Err(anyhow!("No bids in order book — cannot sell back shares"));
-    }
-
-    // Use the best bid price minus slippage to ensure we fill
-    let best_bid: f64 = book.bids[0].price.parse().context("parse best bid price")?;
-    let sell_price = ((best_bid - SLIPPAGE_TOLERANCE) * 100.0).round() / 100.0;
-    let sell_price = sell_price.max(0.01); // floor at 1 cent
-
+    // Settlement delay — wait for shares to be credited to internal balance
     eprintln!(
-        "Sell-back: {} shares of {} at {:.2}c (best bid {:.2}c, slippage {}%)",
-        shares,
-        asset_id,
-        sell_price * 100.0,
-        best_bid * 100.0,
-        SLIPPAGE_TOLERANCE * 100.0
+        "Sell-back: waiting 2s for settlement before selling {} shares of {}",
+        shares, asset_id
     );
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let sell_fee = get_fee_rate(client, asset_id).await.unwrap_or(fee_bps);
-    let salt = now_ms() as u64 + 100;
-    let sell_order =
-        build_order_request(wallet, asset_id, shares, sell_price, "SELL", sell_fee, salt)
-            .await
-            .context("build sell-back order")?;
+    let slippages = [0.03, 0.08, 0.15]; // 3%, 8%, 15% below best bid
+    let retry_delays_s = [0u64, 3, 5]; // inter-attempt delays
 
-    let res = place_single_order(client, wallet, sell_order)
+    for (attempt, (slippage, delay)) in slippages.iter().zip(retry_delays_s.iter()).enumerate() {
+        if *delay > 0 {
+            tokio::time::sleep(Duration::from_secs(*delay)).await;
+        }
+
+        // Re-fetch order book each attempt for fresh best bid
+        let book = match get_order_book(client, asset_id).await {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "Sell-back attempt {}: failed to fetch order book: {:#}",
+                    attempt + 1,
+                    e
+                );
+                continue;
+            }
+        };
+
+        if book.bids.is_empty() {
+            eprintln!(
+                "Sell-back attempt {}: no bids in order book",
+                attempt + 1
+            );
+            continue;
+        }
+
+        let best_bid: f64 = match book.bids[0].price.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let sell_price = ((best_bid - slippage) * 100.0).round() / 100.0;
+        let sell_price = sell_price.max(0.01); // floor at 1 cent
+        let expiration_secs = (now_ms() / 1000) as u64 + 90; // 60s minimum + 30s effective
+
+        let sell_fee = get_fee_rate(client, asset_id).await.unwrap_or(fee_bps);
+        let salt = now_ms() as u64 + 100 + attempt as u64;
+
+        eprintln!(
+            "Sell-back attempt {}: {} shares at {:.2}c (best bid {:.2}c, slippage {:.0}%)",
+            attempt + 1,
+            shares,
+            sell_price * 100.0,
+            best_bid * 100.0,
+            slippage * 100.0
+        );
+
+        let sell_order = match build_order_request(
+            wallet, asset_id, shares, sell_price, "SELL", sell_fee, salt, "GTD", expiration_secs,
+        )
         .await
-        .context("place sell-back order")?;
+        {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!(
+                    "Sell-back attempt {}: build order failed: {:#}",
+                    attempt + 1,
+                    e
+                );
+                continue;
+            }
+        };
 
-    if res.success && res.status.eq_ignore_ascii_case("MATCHED") {
-        Ok(res.order_id)
-    } else if res.success {
-        // Order accepted but not filled — try to cancel
-        let _ = cancel_order(client, wallet, &res.order_id).await;
-        Err(anyhow!(
-            "Sell-back order {} not filled (status={}), cancelled. Shares may still be held.",
-            res.order_id,
-            res.status
-        ))
-    } else {
-        Err(anyhow!("Sell-back rejected: {}", res.error_msg))
+        let res = match place_single_order(client, wallet, sell_order).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "Sell-back attempt {}: place order failed: {:#}",
+                    attempt + 1,
+                    e
+                );
+                continue;
+            }
+        };
+
+        // Immediately filled
+        if res.success && res.status.eq_ignore_ascii_case("MATCHED") {
+            eprintln!(
+                "Sell-back attempt {}: fully filled immediately (order {})",
+                attempt + 1,
+                res.order_id
+            );
+            return Ok(res.order_id);
+        }
+
+        // Order is LIVE on the book — poll for up to 15 seconds
+        if res.success && !res.order_id.is_empty() {
+            eprintln!(
+                "Sell-back attempt {}: order {} LIVE, polling for fills...",
+                attempt + 1,
+                res.order_id
+            );
+            for poll_i in 0..15 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if let Ok(status) = get_order_status(client, wallet, &res.order_id).await {
+                    let matched: f64 = status.size_matched.parse().unwrap_or(0.0);
+                    if matched >= shares as f64 {
+                        eprintln!(
+                            "Sell-back attempt {}: filled after {}s (order {})",
+                            attempt + 1,
+                            poll_i + 1,
+                            res.order_id
+                        );
+                        return Ok(res.order_id);
+                    }
+                }
+            }
+            // Not fully filled after 15s — cancel remainder, try more aggressive price
+            eprintln!(
+                "Sell-back attempt {}: not filled after 15s, cancelling {}",
+                attempt + 1,
+                res.order_id
+            );
+            let _ = cancel_order(client, wallet, &res.order_id).await;
+        } else {
+            eprintln!(
+                "Sell-back attempt {}: rejected: {}",
+                attempt + 1,
+                res.error_msg
+            );
+        }
     }
+
+    Err(anyhow!(
+        "sell-back failed after {} attempts for {} shares of {}",
+        slippages.len(),
+        shares,
+        asset_id
+    ))
 }
 
 async fn get_fee_rate(client: &Client, token_id: &str) -> Result<u64> {
@@ -1689,7 +1839,7 @@ async fn ensure_allowance(client: &Client, wallet: &TradingWallet, spender: &str
 
     // Build TypedTransaction (Legacy) so we can call tx.rlp_signed()
     use ethers::types::transaction::eip2718::TypedTransaction;
-    let mut tx = TypedTransaction::Legacy(ethers::types::TransactionRequest {
+    let tx = TypedTransaction::Legacy(ethers::types::TransactionRequest {
         from: Some(wallet.address),
         to: Some(USDC_E_POLYGON.parse::<Address>().unwrap().into()),
         nonce: Some(U256::from(nonce)),
@@ -1935,6 +2085,7 @@ async fn eip712_order_signature(
     side: u8,
     salt: u64,
     fee_bps: u64,
+    expiration: u64,
 ) -> Result<String> {
     use ethers::types::transaction::eip712::TypedData;
 
@@ -1976,7 +2127,7 @@ async fn eip712_order_signature(
             "tokenId":       token_id,
             "makerAmount":   maker_amount.to_string(),
             "takerAmount":   taker_amount.to_string(),
-            "expiration":    "0",
+            "expiration":    expiration.to_string(),
             "nonce":         "0",
             "feeRateBps":    fee_bps.to_string(),
             "side":          side,
@@ -2002,6 +2153,8 @@ async fn build_order_request(
     side: &str,
     fee_bps: u64,
     salt: u64,
+    order_type: &str,
+    expiration: u64,
 ) -> Result<CreateOrderRequest> {
     let side_uint: u8 = if side == "BUY" { 0 } else { 1 };
 
@@ -2041,6 +2194,7 @@ async fn build_order_request(
         side_uint,
         salt,
         fee_bps,
+        expiration,
     )
     .await?;
 
@@ -2053,7 +2207,7 @@ async fn build_order_request(
         maker_amount: maker_amount.to_string(),
         taker_amount: taker_amount.to_string(),
         side: side.to_string(),
-        expiration: "0".to_string(),
+        expiration: expiration.to_string(),
         nonce: "0".to_string(),
         fee_rate_bps: fee_bps.to_string(),
         signature,
@@ -2063,7 +2217,7 @@ async fn build_order_request(
     Ok(CreateOrderRequest {
         order,
         owner: wallet.creds.api_key.clone(),
-        order_type: "FOK".to_string(),
+        order_type: order_type.to_string(),
         defer_exec: false,
     })
 }
@@ -2140,6 +2294,73 @@ async fn cancel_order(client: &Client, wallet: &Arc<TradingWallet>, order_id: &s
     }
 
     Ok(())
+}
+
+// ── Poll order fill status via GET /data/order/{order_hash} ───────────────────
+async fn get_order_status(
+    client: &Client,
+    wallet: &Arc<TradingWallet>,
+    order_id: &str,
+) -> Result<OpenOrder> {
+    let path = format!("/data/order/{}", order_id);
+    let timestamp = now_ms() / 1000;
+    let l2_sig = l2_signature(&wallet.creds.secret, timestamp, "GET", &path, "")
+        .context("compute L2 HMAC for get_order_status")?;
+
+    let url = format!("{CLOB_API}{}", path);
+    let resp = client
+        .get(&url)
+        .header("POLY_ADDRESS", format!("{:#x}", wallet.address))
+        .header("POLY_SIGNATURE", l2_sig)
+        .header("POLY_TIMESTAMP", timestamp.to_string())
+        .header("POLY_API_KEY", &wallet.creds.api_key)
+        .header("POLY_PASSPHRASE", &wallet.creds.passphrase)
+        .send()
+        .await
+        .context("get order status request")?;
+
+    if !resp.status().is_success() {
+        let error_text = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("Get order status failed: {}", error_text));
+    }
+
+    let order: OpenOrder = resp.json().await.context("parse order status response")?;
+    Ok(order)
+}
+
+// ── Submit multiple orders in a single batch via POST /orders ─────────────────
+async fn place_batch_orders(
+    client: &Client,
+    wallet: &Arc<TradingWallet>,
+    orders: Vec<CreateOrderRequest>,
+) -> Result<Vec<BatchOrderResult>> {
+    let body_str = serde_json::to_string(&orders).context("serialise batch orders")?;
+
+    let timestamp = now_ms() / 1000;
+    let l2_sig = l2_signature(&wallet.creds.secret, timestamp, "POST", "/orders", &body_str)
+        .context("compute L2 HMAC for batch orders")?;
+
+    let url = format!("{CLOB_API}/orders");
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("POLY_ADDRESS", format!("{:#x}", wallet.address))
+        .header("POLY_SIGNATURE", l2_sig)
+        .header("POLY_TIMESTAMP", timestamp.to_string())
+        .header("POLY_API_KEY", &wallet.creds.api_key)
+        .header("POLY_PASSPHRASE", &wallet.creds.passphrase)
+        .body(body_str)
+        .send()
+        .await
+        .context("place batch orders")?;
+
+    if !resp.status().is_success() {
+        let error_text = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("Batch order placement failed: {}", error_text));
+    }
+
+    let results: Vec<BatchOrderResult> = resp.json().await.context("parse batch order response")?;
+    Ok(results)
 }
 
 fn write_candle_csv(state: &MarketState, asset_id: &str, candle: &Candle) -> Result<()> {
@@ -2323,7 +2544,7 @@ async fn send_usdc_transfer(
     let calldata_bytes = hex::decode(&calldata_hex).context("decode USDC transfer calldata")?;
 
     use ethers::types::transaction::eip2718::TypedTransaction;
-    let mut tx = TypedTransaction::Legacy(ethers::types::TransactionRequest {
+    let tx = TypedTransaction::Legacy(ethers::types::TransactionRequest {
         from: Some(wallet.address),
         to: Some(USDC_E_POLYGON.parse::<Address>().unwrap().into()),
         nonce: Some(U256::from(nonce)),
