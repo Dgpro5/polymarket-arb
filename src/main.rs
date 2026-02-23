@@ -245,6 +245,12 @@ const POL_TOP_UP_USDC: f64 = 10.0;
 
 // Polymarket CTF Exchange on Polygon (non-neg-risk markets)
 const CTF_EXCHANGE_ADDRESS: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
+// Neg Risk CTF Exchange on Polygon
+const NEG_RISK_CTF_EXCHANGE: &str = "0xC5d563A36AE78145C45a50134d48A1215220f80a";
+// Conditional Token Framework (ERC-1155) on Polygon — holds all outcome tokens
+const CTF_CONTRACT: &str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
+// Neg Risk Adapter — wraps CTF tokens for neg-risk markets
+const NEG_RISK_ADAPTER: &str = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296";
 const CHAIN_ID: u64 = 137;
 // Zero address — any counterparty can fill the order
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
@@ -297,6 +303,14 @@ async fn run() -> Result<()> {
     ensure_allowance(&client, &wallet, CTF_EXCHANGE_ADDRESS)
         .await
         .context("ensure USDC allowance")?;
+    // Also approve USDC for the Neg Risk CTF Exchange (covers neg-risk markets)
+    ensure_allowance(&client, &wallet, NEG_RISK_CTF_EXCHANGE)
+        .await
+        .context("ensure USDC allowance for Neg Risk Exchange")?;
+    // Approve CTF Exchange(s) to move our ERC-1155 conditional tokens (needed for SELL orders)
+    ensure_ctf_token_approvals(&client, &wallet)
+        .await
+        .context("ensure ERC-1155 token approvals")?;
     check_and_top_up_pol(&client, &wallet)
         .await
         .unwrap_or_else(|e| eprintln!("POL top-up check failed: {e:#}"));
@@ -397,7 +411,7 @@ async fn run() -> Result<()> {
         }
     });
 
-    // Background task: refresh USDC allowance every 5 minutes.
+    // Background task: refresh USDC + ERC-1155 allowances every 5 minutes.
     let allowance_task_wallet = Arc::clone(&wallet);
     let allowance_task_client = client.clone();
     tokio::spawn(async move {
@@ -412,7 +426,21 @@ async fn run() -> Result<()> {
             )
             .await
             {
-                eprintln!("WARN: periodic allowance check failed: {e:#}");
+                eprintln!("WARN: periodic USDC allowance check failed: {e:#}");
+            }
+            if let Err(e) = ensure_allowance(
+                &allowance_task_client,
+                &*allowance_task_wallet,
+                NEG_RISK_CTF_EXCHANGE,
+            )
+            .await
+            {
+                eprintln!("WARN: periodic USDC allowance (neg risk) check failed: {e:#}");
+            }
+            if let Err(e) =
+                ensure_ctf_token_approvals(&allowance_task_client, &*allowance_task_wallet).await
+            {
+                eprintln!("WARN: periodic ERC-1155 approval check failed: {e:#}");
             }
         }
     });
@@ -1357,29 +1385,44 @@ async fn execute_arbitrage_trade(
         second_label, err_1, err_2, buy_shares, first_label
     );
 
-    let sell_result = sell_back_shares(&client, wallet, first_id, buy_shares, fee_bps).await;
-
-    match sell_result {
-        Ok(sell_order_id) => {
-            let msg = format!(
-                "{} failed twice (1st: {} | 2nd: {}). Sold {} {} shares back (order {}). No net position.",
-                second_label, err_1, err_2, buy_shares, first_label, sell_order_id
+    // Retry sell-back up to 3 times with increasing delay.
+    // The first attempt may fail because on-chain settlement from the BUY hasn't
+    // propagated yet, or the order book briefly has no bids.
+    let mut last_sell_err = String::new();
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            let delay_ms = 500 * (1u64 << attempt); // 1s, 2s
+            eprintln!(
+                "Sell-back attempt {} failed — retrying in {}ms…",
+                attempt, delay_ms
             );
-            eprintln!("{}", msg);
-            let _ = send_discord_webhook(&msg).await;
-            Err(anyhow!("{}", msg))
+            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
         }
-        Err(sell_err) => {
-            let msg = format!(
-                "CRITICAL: {} {} filled {} shares, {} failed ({}), SELL-BACK ALSO FAILED: {:#}. \
-                 UNBALANCED POSITION — manual intervention required!",
-                first_label, first_res.order_id, buy_shares, second_label, err_2, sell_err
-            );
-            eprintln!("{}", msg);
-            let _ = send_discord_webhook(&msg).await;
-            Err(anyhow!("{}", msg))
+        match sell_back_shares(&client, wallet, first_id, buy_shares, fee_bps).await {
+            Ok(sell_order_id) => {
+                let msg = format!(
+                    "{} failed twice (1st: {} | 2nd: {}). Sold {} {} shares back (order {}, attempt {}). No net position.",
+                    second_label, err_1, err_2, buy_shares, first_label, sell_order_id, attempt + 1
+                );
+                eprintln!("{}", msg);
+                let _ = send_discord_webhook(&msg).await;
+                return Err(anyhow!("{}", msg));
+            }
+            Err(e) => {
+                last_sell_err = format!("{:#}", e);
+                eprintln!("Sell-back attempt {} error: {}", attempt + 1, last_sell_err);
+            }
         }
     }
+
+    let msg = format!(
+        "CRITICAL: {} {} filled {} shares, {} failed ({}), SELL-BACK FAILED 3 TIMES: {}. \
+         UNBALANCED POSITION — manual intervention required!",
+        first_label, first_res.order_id, buy_shares, second_label, err_2, last_sell_err
+    );
+    eprintln!("{}", msg);
+    let _ = send_discord_webhook(&msg).await;
+    Err(anyhow!("{}", msg))
 }
 
 /// Sell back shares that were bought on one side when the other side failed.
@@ -1792,6 +1835,236 @@ async fn ensure_allowance(client: &Client, wallet: &TradingWallet, spender: &str
     Err(anyhow!(
         "Approve tx not confirmed within 30s. Check Polygonscan: {tx_hash}"
     ))
+}
+
+// ── ERC-1155 approval helpers ───────────────────────────────────────────────
+//
+// The CTF Exchange needs `setApprovalForAll` on the conditional-token (ERC-1155)
+// contract before it can transfer shares out of our wallet (i.e. for SELL orders
+// and sell-back unwinds).  Without this, any SELL order fails with
+// "not enough balance / allowance".
+
+/// Check whether `operator` is approved to move all ERC-1155 tokens on
+/// `erc1155_contract` belonging to `owner`.
+async fn is_approved_for_all(
+    client: &Client,
+    erc1155_contract: &str,
+    owner: &Address,
+    operator: &str,
+) -> Result<bool> {
+    let ankr_key = env::var(ANKR_API_KEY_ENV)
+        .with_context(|| format!("Missing env var '{ANKR_API_KEY_ENV}'"))?;
+    let rpc_url = format!("https://rpc.ankr.com/polygon/{}", ankr_key.trim());
+
+    let owner_hex = format!("{:x}", owner);
+    let operator_hex = operator.trim_start_matches("0x");
+    // isApprovedForAll(address,address) selector = 0xe985e9c5
+    let calldata = format!("0xe985e9c5{:0>64}{:0>64}", owner_hex, operator_hex);
+
+    let body = json!({
+        "jsonrpc": "2.0",
+        "method": "eth_call",
+        "params": [{ "to": erc1155_contract, "data": calldata }, "latest"],
+        "id": 1
+    });
+
+    let resp = client
+        .post(&rpc_url)
+        .json(&body)
+        .send()
+        .await
+        .context("eth_call isApprovedForAll")?;
+    let raw = resp.text().await.context("read isApprovedForAll response")?;
+    let parsed: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parse isApprovedForAll JSON: {raw}"))?;
+
+    if let Some(err) = parsed.get("error") {
+        return Err(anyhow!("isApprovedForAll eth_call error: {err}"));
+    }
+
+    let hex = parsed
+        .get("result")
+        .and_then(|v| v.as_str())
+        .unwrap_or("0x0")
+        .trim_start_matches("0x");
+    let val = u128::from_str_radix(hex, 16).unwrap_or(0);
+    Ok(val != 0)
+}
+
+/// Send a `setApprovalForAll(operator, true)` transaction on an ERC-1155
+/// contract so the operator can transfer our tokens.
+async fn send_set_approval_for_all(
+    client: &Client,
+    wallet: &TradingWallet,
+    erc1155_contract: &str,
+    operator: &str,
+) -> Result<()> {
+    let ankr_key = env::var(ANKR_API_KEY_ENV)
+        .with_context(|| format!("Missing env var '{ANKR_API_KEY_ENV}'"))?;
+    let rpc_url = format!("https://rpc.ankr.com/polygon/{}", ankr_key.trim());
+
+    // Get nonce
+    let nonce_body = json!({
+        "jsonrpc": "2.0", "method": "eth_getTransactionCount",
+        "params": [format!("{:#x}", wallet.address), "latest"], "id": 1
+    });
+    let nonce_resp: Value = client
+        .post(&rpc_url)
+        .json(&nonce_body)
+        .send()
+        .await
+        .context("get nonce for setApprovalForAll")?
+        .json()
+        .await
+        .context("parse nonce")?;
+    let nonce = nonce_resp["result"]
+        .as_str()
+        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .ok_or_else(|| anyhow!("could not parse nonce: {nonce_resp}"))?;
+
+    // Get gas price
+    let gas_body = json!({"jsonrpc":"2.0","method":"eth_gasPrice","params":[],"id":1});
+    let gas_resp: Value = client
+        .post(&rpc_url)
+        .json(&gas_body)
+        .send()
+        .await
+        .context("get gas price")?
+        .json()
+        .await
+        .context("parse gas price")?;
+    let gas_price = gas_resp["result"]
+        .as_str()
+        .and_then(|s| u128::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .ok_or_else(|| anyhow!("could not parse gas price: {gas_resp}"))?;
+
+    // setApprovalForAll(address operator, bool approved) selector = 0xa22cb465
+    let operator_hex = operator.trim_start_matches("0x");
+    let calldata_hex = format!(
+        "a22cb465{:0>64}{:0>64}",
+        operator_hex,
+        "1" // true
+    );
+    let calldata_bytes = hex::decode(&calldata_hex).context("decode setApprovalForAll calldata")?;
+
+    use ethers::types::transaction::eip2718::TypedTransaction;
+    let mut tx = TypedTransaction::Legacy(ethers::types::TransactionRequest {
+        from: Some(wallet.address),
+        to: Some(
+            erc1155_contract
+                .parse::<Address>()
+                .context("parse ERC-1155 contract address")?
+                .into(),
+        ),
+        nonce: Some(U256::from(nonce)),
+        gas: Some(U256::from(100_000u64)),
+        gas_price: Some(U256::from(gas_price * 3)),
+        data: Some(calldata_bytes.into()),
+        value: Some(U256::zero()),
+        chain_id: Some(U64::from(CHAIN_ID)),
+        ..Default::default()
+    });
+
+    let sig = wallet
+        .wallet
+        .sign_transaction(&tx)
+        .await
+        .map_err(|e| anyhow!("sign setApprovalForAll tx: {e}"))?;
+
+    let raw_tx = format!("0x{}", hex::encode(tx.rlp_signed(&sig)));
+
+    let send_body = json!({
+        "jsonrpc": "2.0", "method": "eth_sendRawTransaction",
+        "params": [raw_tx], "id": 1
+    });
+    let send_resp: Value = client
+        .post(&rpc_url)
+        .json(&send_body)
+        .send()
+        .await
+        .context("send setApprovalForAll tx")?
+        .json()
+        .await
+        .context("parse send response")?;
+
+    if let Some(err) = send_resp.get("error") {
+        return Err(anyhow!("setApprovalForAll tx failed: {err}"));
+    }
+
+    let tx_hash = send_resp["result"]
+        .as_str()
+        .ok_or_else(|| anyhow!("no tx hash in setApprovalForAll response: {send_resp}"))?;
+
+    eprintln!("setApprovalForAll tx sent: {tx_hash} — waiting for confirmation…");
+
+    // Poll for receipt (up to 30 seconds)
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let receipt_body = json!({
+            "jsonrpc": "2.0", "method": "eth_getTransactionReceipt",
+            "params": [tx_hash], "id": 1
+        });
+        let receipt: Value = client
+            .post(&rpc_url)
+            .json(&receipt_body)
+            .send()
+            .await
+            .context("get receipt")?
+            .json()
+            .await
+            .context("parse receipt")?;
+
+        if let Some(r) = receipt.get("result").filter(|v| !v.is_null()) {
+            let status = r["status"].as_str().unwrap_or("0x0");
+            if status == "0x1" {
+                eprintln!("setApprovalForAll confirmed: {tx_hash}");
+                return Ok(());
+            } else {
+                return Err(anyhow!(
+                    "setApprovalForAll tx reverted. Check wallet has POL for gas."
+                ));
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "setApprovalForAll tx not confirmed within 30s. Check Polygonscan: {tx_hash}"
+    ))
+}
+
+/// Ensure the CTF Exchange (and Neg Risk CTF Exchange) are approved to move
+/// our conditional tokens.  Checks on-chain and only sends a tx if needed.
+async fn ensure_ctf_token_approvals(client: &Client, wallet: &TradingWallet) -> Result<()> {
+    // Pairs: (erc1155_contract, operator, label)
+    let pairs: &[(&str, &str, &str)] = &[
+        (CTF_CONTRACT, CTF_EXCHANGE_ADDRESS, "CTF → CTF Exchange"),
+        (CTF_CONTRACT, NEG_RISK_CTF_EXCHANGE, "CTF → Neg Risk Exchange"),
+        (NEG_RISK_ADAPTER, NEG_RISK_CTF_EXCHANGE, "NegRiskAdapter → Neg Risk Exchange"),
+    ];
+
+    for &(contract, operator, label) in pairs {
+        match is_approved_for_all(client, contract, &wallet.address, operator).await {
+            Ok(true) => {
+                eprintln!("ERC-1155 approval OK: {label}");
+            }
+            Ok(false) => {
+                eprintln!("ERC-1155 approval missing: {label} — sending setApprovalForAll…");
+                send_set_approval_for_all(client, wallet, contract, operator)
+                    .await
+                    .with_context(|| format!("setApprovalForAll for {label}"))?;
+            }
+            Err(e) => {
+                eprintln!("WARN: could not check ERC-1155 approval for {label}: {e:#}");
+                // Try to set it anyway — better safe than stuck
+                if let Err(e2) = send_set_approval_for_all(client, wallet, contract, operator).await
+                {
+                    eprintln!("WARN: setApprovalForAll for {label} also failed: {e2:#}");
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ── L1 EIP-712 Auth ─────────────────────────────────────────────────────────
