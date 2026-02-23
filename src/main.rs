@@ -1318,7 +1318,7 @@ async fn execute_arbitrage_trade(
         up_filled, buy_shares, down_filled, buy_shares
     );
 
-    // ═══════════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════ 
     //  PHASE 4: Handle results — sell back excess if mismatched.
     // ═══════════════════════════════════════════════════════════════════════
     let matched = up_filled.min(down_filled);
