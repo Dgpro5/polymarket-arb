@@ -745,8 +745,7 @@ async fn run_socket(
             Ok(Message::Close(_)) => break,
             Ok(_) => {}
             Err(e) => {
-                eprintln!("WS error: {e}");
-                break;
+                return Err(anyhow!("WS error: {e}"));
             }
         }
     }
@@ -1299,12 +1298,7 @@ async fn execute_arbitrage_trade(
         .into());
     }
 
-    // ── Order book (REST) — used for BOTH sizing AND pricing ─────────────
-    // CRITICAL: Use the REST order book best-ask for order prices, NOT the
-    // websocket price.  The websocket ask can be stale.  With FAK orders the
-    // exchange fills by spending maker_amount at the best available price,
-    // so a stale high limit price causes oversized fills (e.g. 112 shares
-    // instead of 33).
+    // ── Order book (REST) — used for depth sizing ONLY ─────────────────
     let up_book = get_order_book(&client, up_asset_id).await?;
     let up_depth = calculate_total_size(&up_book.asks)?;
     let down_book = get_order_book(&client, down_asset_id).await?;
@@ -1313,25 +1307,16 @@ async fn execute_arbitrage_trade(
     // Take 50% of the thinner side's depth — smaller orders fill more reliably
     let liquidity_shares = (up_depth.min(down_depth) * 0.5).floor();
 
-    // Use REST best ask for pricing — this is the actual current book price.
-    let up_book_ask: f64 = up_book
-        .asks
-        .first()
-        .and_then(|l| l.price.parse().ok())
-        .unwrap_or(up_ask);
-    let down_book_ask: f64 = down_book
-        .asks
-        .first()
-        .and_then(|l| l.price.parse().ok())
-        .unwrap_or(down_ask);
-
-    // Round to tick size (0.01)
-    let up_order_price = (up_book_ask * 100.0).ceil() / 100.0;
-    let down_order_price = (down_book_ask * 100.0).ceil() / 100.0;
+    // ── Pricing: use WS ask directly as FAK limit price ─────────────────
+    // The limit price determines maker_amount (USDC budget).  By using the
+    // WS ask, maker_amount = shares × ws_price, so the exchange buys
+    // approximately the requested number of shares on each side.
+    let up_order_price = (up_ask * 100.0).round() / 100.0;
+    let down_order_price = (down_ask * 100.0).round() / 100.0;
 
     eprintln!(
-        "Pricing — WS ask: UP={:.4} DOWN={:.4} | Book ask: UP={:.4} DOWN={:.4} | Order price: UP={:.2}c DOWN={:.2}c",
-        up_ask, down_ask, up_book_ask, down_book_ask, up_order_price * 100.0, down_order_price * 100.0
+        "Pricing — WS ask: UP={:.2}c DOWN={:.2}c | depth: UP={:.0} DOWN={:.0}",
+        up_order_price * 100.0, down_order_price * 100.0, up_depth, down_depth
     );
 
     let cost_per_pair = up_order_price + down_order_price;
