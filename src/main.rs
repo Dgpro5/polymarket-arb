@@ -1298,11 +1298,24 @@ async fn execute_arbitrage_trade(
         .into());
     }
 
-    // ── Order book (REST) — used for depth sizing ONLY ─────────────────
+    // ── Order book (REST) — depth sizing + liquidity verification ───────
     let up_book = get_order_book(&client, up_asset_id).await?;
     let up_depth = calculate_total_size(&up_book.asks)?;
     let down_book = get_order_book(&client, down_asset_id).await?;
     let down_depth = calculate_total_size(&down_book.asks)?;
+
+    // Verify both sides have actual ask liquidity on the REST book.
+    // If one side is empty, FAK will get zero fills → one-sided exposure.
+    let up_best_ask: Option<f64> = up_book.asks.first().and_then(|l| l.price.parse().ok());
+    let down_best_ask: Option<f64> = down_book.asks.first().and_then(|l| l.price.parse().ok());
+
+    if up_best_ask.is_none() || down_best_ask.is_none() {
+        return Err(anyhow!(
+            "No ask liquidity on REST book — UP: {} DOWN: {}. Skipping to avoid one-sided fill.",
+            if up_best_ask.is_some() { "OK" } else { "EMPTY" },
+            if down_best_ask.is_some() { "OK" } else { "EMPTY" },
+        ));
+    }
 
     // Take 50% of the thinner side's depth — smaller orders fill more reliably
     let liquidity_shares = (up_depth.min(down_depth) * 0.5).floor();
@@ -1312,16 +1325,18 @@ async fn execute_arbitrage_trade(
     // ask keeps maker_amount ≈ shares × market_price (equal shares per side).
     // The +1c buffer absorbs normal price drift between WS update and order
     // hit, preventing "no orders found" rejections and one-sided fills.
-    // Cost: 2c total off a typical 10-15c edge — negligible.
     let up_order_price = ((up_ask + 0.01) * 100.0).ceil() / 100.0;
     let down_order_price = ((down_ask + 0.01) * 100.0).ceil() / 100.0;
 
     eprintln!(
-        "Pricing — WS ask: UP={:.2}c DOWN={:.2}c (+1c) | depth: UP={:.0} DOWN={:.0}",
-        up_ask * 100.0, down_ask * 100.0, up_depth, down_depth
+        "Pricing — WS ask: UP={:.2}c DOWN={:.2}c (+1c) | Book ask: UP={:.2}c DOWN={:.2}c | depth: UP={:.0} DOWN={:.0}",
+        up_ask * 100.0, down_ask * 100.0,
+        up_best_ask.unwrap() * 100.0, down_best_ask.unwrap() * 100.0,
+        up_depth, down_depth
     );
 
     let cost_per_pair = up_order_price + down_order_price;
+
     let available = balance - MIN_BALANCE_USDC;
     let affordable_shares = (available / cost_per_pair).floor();
     // Cap so the more expensive leg never exceeds half the available balance.
