@@ -1446,22 +1446,18 @@ async fn execute_arbitrage_trade(
     // Sell back excess on whichever side filled more
     let excess_up = up_filled.saturating_sub(matched);
     let excess_down = down_filled.saturating_sub(matched);
+    let mut sellback_note = String::new();
 
     if excess_up > 0 {
         eprintln!("Mismatch: selling back {} excess UP shares", excess_up);
         match sell_back_shares(&client, wallet, up_asset_id, excess_up, fee_bps).await {
             Ok(oid) => {
-                let msg = format!("Sold back {} excess UP shares (order {})", excess_up, oid);
-                eprintln!("{}", msg);
-                let _ = send_discord_webhook(&msg).await;
+                sellback_note = format!("Sold {} UP (order {})", excess_up, &oid[..10]);
+                eprintln!("{}", sellback_note);
             }
             Err(e) => {
-                let msg = format!(
-                    "CRITICAL: {} excess UP shares could not be sold back: {:#}. UNBALANCED.",
-                    excess_up, e
-                );
-                eprintln!("{}", msg);
-                let _ = send_discord_webhook(&msg).await;
+                sellback_note = format!("FAILED to sell {} UP: {:#}", excess_up, e);
+                eprintln!("CRITICAL: {}", sellback_note);
             }
         }
     }
@@ -1470,17 +1466,12 @@ async fn execute_arbitrage_trade(
         eprintln!("Mismatch: selling back {} excess DOWN shares", excess_down);
         match sell_back_shares(&client, wallet, down_asset_id, excess_down, fee_bps).await {
             Ok(oid) => {
-                let msg = format!("Sold back {} excess DOWN shares (order {})", excess_down, oid);
-                eprintln!("{}", msg);
-                let _ = send_discord_webhook(&msg).await;
+                sellback_note = format!("Sold {} DOWN (order {})", excess_down, &oid[..10]);
+                eprintln!("{}", sellback_note);
             }
             Err(e) => {
-                let msg = format!(
-                    "CRITICAL: {} excess DOWN shares could not be sold back: {:#}. UNBALANCED.",
-                    excess_down, e
-                );
-                eprintln!("{}", msg);
-                let _ = send_discord_webhook(&msg).await;
+                sellback_note = format!("FAILED to sell {} DOWN: {:#}", excess_down, e);
+                eprintln!("CRITICAL: {}", sellback_note);
             }
         }
     }
@@ -1488,9 +1479,10 @@ async fn execute_arbitrage_trade(
     // If one leg filled but the other got nothing — sell-back was already attempted above
     if matched == 0 {
         return Err(anyhow!(
-            "One-sided fill (UP={}, DOWN={}). Sell-back attempted for excess.",
+            "One-sided fill (UP={}, DOWN={}). Sell-back: {}",
             up_filled,
-            down_filled
+            down_filled,
+            sellback_note
         ));
     }
 
@@ -2958,22 +2950,6 @@ async fn send_error_alert(message: &str) -> Result<()> {
         .send()
         .await
         .context("send error alert webhook")?;
-    Ok(())
-}
-
-async fn send_discord_webhook(message: &str) -> Result<()> {
-    if DISCORD_WEBHOOK_URL.trim().is_empty() {
-        return Ok(());
-    }
-
-    let client = Client::new();
-    let payload = json!({ "content": message });
-    client
-        .post(DISCORD_WEBHOOK_URL)
-        .json(&payload)
-        .send()
-        .await
-        .context("send discord webhook")?;
     Ok(())
 }
 
