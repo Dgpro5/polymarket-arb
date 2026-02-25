@@ -1317,21 +1317,33 @@ async fn execute_arbitrage_trade(
         ));
     }
 
+    let up_book_price = up_best_ask.unwrap();
+    let down_book_price = down_best_ask.unwrap();
+    let book_sum = up_book_price + down_book_price;
+
+    // Validate the arb against the REAL order book, not the WS.
+    // The WS can report stale/phantom prices (e.g. 12c+78c=90c) while
+    // the actual book has asks at 99c+99c.  No real arb exists there.
+    if book_sum >= 1.0 {
+        return Err(anyhow!(
+            "REST book asks sum to {:.2}c (UP {:.2}c + DOWN {:.2}c) >= 100c. WS signal is stale — no real arb.",
+            book_sum * 100.0, up_book_price * 100.0, down_book_price * 100.0
+        ));
+    }
+
     // Take 50% of the thinner side's depth — smaller orders fill more reliably
     let liquidity_shares = (up_depth.min(down_depth) * 0.5).floor();
 
-    // ── Pricing: WS ask + 1c buffer as FAK limit price ──────────────────
-    // The limit price determines maker_amount (USDC budget).  Using the WS
-    // ask keeps maker_amount ≈ shares × market_price (equal shares per side).
-    // The +1c buffer absorbs normal price drift between WS update and order
-    // hit, preventing "no orders found" rejections and one-sided fills.
-    let up_order_price = ((up_ask + 0.01) * 100.0).ceil() / 100.0;
-    let down_order_price = ((down_ask + 0.01) * 100.0).ceil() / 100.0;
+    // ── Pricing: REST book best ask + 1c buffer as FAK limit price ───────
+    // Use the REST book price (not WS) for the limit — this is the actual
+    // price we can fill at.  The +1c buffer absorbs minor drift.
+    let up_order_price = ((up_book_price + 0.01) * 100.0).ceil() / 100.0;
+    let down_order_price = ((down_book_price + 0.01) * 100.0).ceil() / 100.0;
 
     eprintln!(
-        "Pricing — WS ask: UP={:.2}c DOWN={:.2}c (+1c) | Book ask: UP={:.2}c DOWN={:.2}c | depth: UP={:.0} DOWN={:.0}",
+        "Pricing — WS ask: UP={:.2}c DOWN={:.2}c | Book ask: UP={:.2}c DOWN={:.2}c (+1c) | depth: UP={:.0} DOWN={:.0}",
         up_ask * 100.0, down_ask * 100.0,
-        up_best_ask.unwrap() * 100.0, down_best_ask.unwrap() * 100.0,
+        up_book_price * 100.0, down_book_price * 100.0,
         up_depth, down_depth
     );
 
