@@ -292,11 +292,6 @@ const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args: Vec<String> = env::args().collect();
-    if args.iter().any(|a| a == "--scan") {
-        return scan_all_markets().await;
-    }
-
     if let Err(err) = run().await {
         let log = format!("{:#}", &err);
         eprintln!("FATAL ERROR: {log}");
@@ -312,6 +307,16 @@ async fn main() -> Result<()> {
 async fn run() -> Result<()> {
     dotenvy::dotenv().ok();
     fs::create_dir_all(DATA_DIR).context("create data dir")?;
+
+    // Ensure the pending redemptions file exists
+    if !std::path::Path::new(REDEMPTIONS_PATH).exists() {
+        fs::write(REDEMPTIONS_PATH, "[]").context("create pending redemptions file")?;
+    }
+
+    // Scan all active markets for arbitrage opportunities on startup
+    if let Err(e) = scan_all_markets().await {
+        eprintln!("Market scan failed (non-fatal): {e:#}");
+    }
 
     // Reads PRIVATE_KEY from the .env file (loaded above via dotenvy::dotenv()).
     // Never hardcode this value — keep it in .env and add .env to .gitignore.
