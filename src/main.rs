@@ -36,6 +36,7 @@ const CANDLE_MS: i64 = 5 * 60 * 1000;
 const DATA_DIR: &str = "data";
 const LATEST_PATH: &str = "data/btc_updown_5m_latest.json";
 const CSV_PATH: &str = "data/btc_updown_5m_candles.csv";
+const REDEMPTIONS_PATH: &str = "data/pending_redemptions.json";
 const DISCORD_WEBHOOK_URL: &str = "https://discord.com/api/webhooks/1473284259363164211/4sgTuuoGlwS4OyJ5x6-QmpPA_Q1gvsIZB9EZrb9zWX6qyA0LMQklz3IupBfINPVnpsMZ";
 const ERROR_DISCORD_WEBHOOK_URL: &str = "https://discord.com/api/webhooks/1475092817654055084/_mr0tTCdzyyoJtTBwNqE6KYj6SQ0XEegZFv4j5PejJ0vq2i1Vlt0oi7IFmeAt12j0TQW";
 const DETECTION_COOLDOWN_MS: i64 = 5_000; // 5 seconds — prevent rapid sequential trades
@@ -120,6 +121,47 @@ struct MoneyManager {
     total_shares_bought: i64,
     money_spent: f64,
     balance_at_window_start: f64, // snapshot for profit calculation at window close
+}
+
+/// A market where we placed orders and need to redeem after resolution.
+/// Persisted to REDEMPTIONS_PATH so redemptions survive bot restarts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingRedemption {
+    slug: String,
+    condition_id: String,
+    /// Unix timestamp (seconds) after which we should attempt redemption.
+    /// Typically window end_ts + 15 minutes (900s) to allow oracle confirmation.
+    redeem_after_ts: i64,
+}
+
+/// Load pending redemptions from the JSON file, or return an empty list.
+fn load_pending_redemptions() -> Vec<PendingRedemption> {
+    match fs::read_to_string(REDEMPTIONS_PATH) {
+        Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Save pending redemptions to the JSON file.
+fn save_pending_redemptions(redemptions: &[PendingRedemption]) {
+    if let Ok(json) = serde_json::to_string_pretty(redemptions) {
+        let _ = fs::write(REDEMPTIONS_PATH, json);
+    }
+}
+
+/// Add a new market to the pending redemptions file (deduplicates by condition_id).
+fn add_pending_redemption(slug: &str, condition_id: &str, end_ts: i64) {
+    let mut redemptions = load_pending_redemptions();
+    // Don't add duplicates
+    if redemptions.iter().any(|r| r.condition_id == condition_id) {
+        return;
+    }
+    redemptions.push(PendingRedemption {
+        slug: slug.to_string(),
+        condition_id: condition_id.to_string(),
+        redeem_after_ts: end_ts + 900, // +15 minutes for oracle confirmation
+    });
+    save_pending_redemptions(&redemptions);
 }
 
 #[derive(Debug, Clone)]
@@ -307,7 +349,7 @@ async fn run() -> Result<()> {
     check_and_top_up_pol(&client, &wallet)
         .await
         .unwrap_or_else(|e| eprintln!("POL top-up check failed: {e:#}"));
-    redeem_prior_windows(&client, &private_key).await;
+    redeem_pending_markets(&private_key).await;
 
     // Initialize money manager
     let money: Arc<Mutex<MoneyManager>> = Arc::new(Mutex::new(MoneyManager {
@@ -470,6 +512,36 @@ async fn run() -> Result<()> {
         }
     });
 
+    // Background task: check pending redemptions every 2 minutes
+    let redeem_task_pk = private_key.clone();
+    let redeem_task_client = client.clone();
+    let redeem_task_wallet = Arc::clone(&wallet);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(120));
+        ticker.tick().await; // first tick fires immediately, skip it
+        loop {
+            ticker.tick().await;
+            let redeemed = redeem_pending_markets(&redeem_task_pk).await;
+            if redeemed > 0 {
+                if let Ok(bal) = get_balance(&redeem_task_client, &redeem_task_wallet.address).await
+                {
+                    let embed = json!({
+                        "title": "Positions Redeemed",
+                        "color": 0x2ECC71,
+                        "fields": [
+                            { "name": "Markets Redeemed", "value": format!("{}", redeemed), "inline": true },
+                            { "name": "Balance", "value": format!("${:.4}", bal), "inline": true }
+                        ],
+                        "footer": { "text": "Polymarket Arbitrage Bot" }
+                    });
+                    if let Err(e) = send_discord_embed(embed).await {
+                        eprintln!("Discord redeem embed failed: {e:#}");
+                    }
+                }
+            }
+        }
+    });
+
     let mut backoff = 2u64;
     loop {
         match discover_active_btc_5m_market(&client).await {
@@ -558,6 +630,7 @@ async fn run() -> Result<()> {
 
                     // Window-close embed — show what we spent this window
                     let balance_now = get_balance(&client, &wallet.address).await.unwrap_or(0.0);
+                    let pending = load_pending_redemptions();
                     let m = money.lock().await;
                     let embed = json!({
                         "title": "Window Closed",
@@ -568,45 +641,19 @@ async fn run() -> Result<()> {
                             { "name": "Balance", "value": format!("${:.4}", balance_now), "inline": true },
                             { "name": "Total Spent", "value": format!("${:.4}", m.money_spent), "inline": true },
                             { "name": "Trades", "value": format!("{}", m.total_buy_positions), "inline": true },
-                            { "name": "Total Shares", "value": format!("{}", m.total_shares_bought), "inline": true }
+                            { "name": "Total Shares", "value": format!("{}", m.total_shares_bought), "inline": true },
+                            { "name": "Pending Redemptions", "value": format!("{}", pending.len()), "inline": true }
                         ],
-                        "footer": { "text": "Redemption happens on next cycle once oracle resolves the market" }
+                        "footer": { "text": "Redemptions checked every 2 min by background task" }
                     });
                     drop(m);
                     if let Err(e) = send_discord_embed(embed).await {
                         eprintln!("Discord window-close embed failed: {e:#}");
                     }
 
-                    // Redeem OLDER windows that the oracle has had time to resolve.
-                    // The window that just closed is too fresh — skip it (index starts at 2).
-                    let redeemed = redeem_prior_windows(&client, &private_key).await;
-
-                    // If anything was redeemed, show the new balance
-                    if redeemed > 0 {
-                        if let Ok(bal) = get_balance(&client, &wallet.address).await {
-                            let bal_before = money.lock().await.balance_at_window_start;
-                            let profit = bal - bal_before;
-                            let profit_str = format!(
-                                "{}{:.4}",
-                                if profit >= 0.0 { "+$" } else { "-$" },
-                                profit.abs()
-                            );
-                            let color = if profit >= 0.0 { 0x2ECC71 } else { 0xE74C3C };
-                            let embed = json!({
-                                "title": "Positions Redeemed",
-                                "color": color,
-                                "fields": [
-                                    { "name": "Windows Redeemed", "value": format!("{}", redeemed), "inline": true },
-                                    { "name": "Profit", "value": &profit_str, "inline": true },
-                                    { "name": "New Balance", "value": format!("${:.4}", bal), "inline": true }
-                                ],
-                                "footer": { "text": "Polymarket Arbitrage Bot" }
-                            });
-                            if let Err(e) = send_discord_embed(embed).await {
-                                eprintln!("Discord redeem embed failed: {e:#}");
-                            }
-                        }
-                    }
+                    // Opportunistic redemption check on window close (background task
+                    // also checks every 2 min, but this catches any that just became ready).
+                    redeem_pending_markets(&private_key).await;
 
                     // Refill POL if running low
                     check_and_top_up_pol(&client, &wallet)
@@ -1335,11 +1382,20 @@ async fn print_up_down(
                     if let Err(e) = send_discord_embed(embed).await {
                         eprintln!("Discord embed failed: {e:#}");
                     }
+
+                    // Record this market for later redemption
+                    add_pending_redemption(
+                        &state.market_slug,
+                        &state.condition_id,
+                        state.end_ts,
+                    );
                 }
                 Err(e) => {
                     let log = format!("{:#}", e);
                     eprintln!("TRADE FAILED: {log}");
-                    if !is_insufficient_balance_error(&e) {
+                    // Only send Discord alerts for unexpected errors, not stale-signal
+                    // "no arb" rejections (REST book sum >= 100c) or insufficient balance.
+                    if !is_insufficient_balance_error(&e) && !is_stale_signal_error(&e) {
                         let alert = format!(
                             "Trade failed (assets {}/{} | sum {:.2}c):\n```\n{}\n```",
                             up_asset, down_asset, sum_cents, log
@@ -1378,6 +1434,15 @@ impl std::error::Error for InsufficientBalanceError {}
 
 fn is_insufficient_balance_error(err: &Error) -> bool {
     err.downcast_ref::<InsufficientBalanceError>().is_some()
+}
+
+/// Stale-signal errors (REST book >= 100c, no liquidity, too few shares) are
+/// informational, not actionable. Suppress their Discord alerts.
+fn is_stale_signal_error(err: &Error) -> bool {
+    let msg = format!("{err:#}");
+    msg.contains("WS signal is stale")
+        || msg.contains("No ask liquidity on REST book")
+        || msg.contains("shares possible (min")
 }
 
 #[derive(Debug)]
@@ -1976,52 +2041,82 @@ async fn redeem_positions(private_key: &str, condition_id_hex: &str) -> Result<(
     Ok(())
 }
 
-/// Scans the last 6 windows (skipping the most recent one — too fresh for oracle)
-/// and attempts to redeem positions from any that have been resolved.
-/// Returns the count of successfully redeemed windows.
-async fn redeem_prior_windows(client: &Client, private_key: &str) -> u32 {
+/// Checks the pending redemptions JSON file and attempts to redeem any markets
+/// whose `redeem_after_ts` has passed.  Successfully redeemed entries are removed
+/// from the file.  Failed (non-revert) redemptions trigger a Discord error alert.
+/// Returns the count of successfully redeemed markets.
+async fn redeem_pending_markets(private_key: &str) -> u32 {
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
 
+    let redemptions = load_pending_redemptions();
+    if redemptions.is_empty() {
+        return 0;
+    }
+
     let mut redeemed = 0u32;
+    let mut remaining: Vec<PendingRedemption> = Vec::new();
 
-    // Start from i=2 (10 min ago) — give the oracle at least one full window to resolve.
-    // Go back up to 6 windows (30 min).
-    for i in 2..=6 {
-        let window_start = (now_secs / 300) * 300 - i * 300;
-        let slug = format!("btc-updown-5m-{window_start}");
-        let url = format!("{GAMMA_API}/markets?slug={slug}");
+    for entry in &redemptions {
+        if now_secs < entry.redeem_after_ts {
+            // Not ready yet — keep for later
+            remaining.push(entry.clone());
+            continue;
+        }
 
-        let cid = match client.get(&url).send().await {
-            Ok(resp) => match resp.json::<Value>().await {
-                Ok(data) => data
-                    .as_array()
-                    .and_then(|a| a.first())
-                    .and_then(|m| m.get("conditionId"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-                Err(_) => None,
-            },
-            Err(_) => None,
-        };
+        eprintln!(
+            "Attempting redemption: {} (condition {})",
+            entry.slug, entry.condition_id
+        );
 
-        if let Some(cid) = cid {
-            match redeem_positions(private_key, &cid).await {
-                Ok(_) => {
-                    redeemed += 1;
-                }
-                Err(e) => {
-                    // "execution reverted" is normal for unresolved or already-redeemed markets
-                    let msg = format!("{e:#}");
-                    if msg.contains("revert") || msg.contains("insufficient") {
+        match redeem_positions(private_key, &entry.condition_id).await {
+            Ok(_) => {
+                eprintln!("  Redeemed successfully: {}", entry.slug);
+                redeemed += 1;
+                // Do not add to remaining — it's done
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                if msg.contains("revert") || msg.contains("insufficient") {
+                    // "execution reverted" means oracle hasn't resolved yet, or
+                    // already redeemed. Keep it for a bit longer, but remove if
+                    // it's been more than 1 hour past the scheduled time.
+                    if now_secs - entry.redeem_after_ts > 3600 {
+                        eprintln!(
+                            "  Removing stale redemption (>1h overdue): {} — {:#}",
+                            entry.slug, e
+                        );
+                        let alert = format!(
+                            "Redemption failed after 1h for `{}`:\n```\n{}\n```",
+                            entry.slug, msg
+                        );
+                        if let Err(ae) = send_error_alert(&alert).await {
+                            eprintln!("  Failed to send redeem alert: {ae:#}");
+                        }
                     } else {
-                        eprintln!("Redeem failed for {slug}: {e:#}");
+                        remaining.push(entry.clone());
                     }
+                } else {
+                    // Unexpected error — alert and keep for retry
+                    eprintln!("  Redeem error for {}: {:#}", entry.slug, e);
+                    let alert = format!(
+                        "Redemption error for `{}`:\n```\n{}\n```",
+                        entry.slug, msg
+                    );
+                    if let Err(ae) = send_error_alert(&alert).await {
+                        eprintln!("  Failed to send redeem alert: {ae:#}");
+                    }
+                    remaining.push(entry.clone());
                 }
             }
         }
+    }
+
+    // Only rewrite the file if something changed
+    if remaining.len() != redemptions.len() {
+        save_pending_redemptions(&remaining);
     }
 
     redeemed
