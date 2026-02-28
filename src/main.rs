@@ -39,6 +39,10 @@ const CSV_PATH: &str = "data/btc_updown_5m_candles.csv";
 const DISCORD_WEBHOOK_URL: &str = "https://discord.com/api/webhooks/1473284259363164211/4sgTuuoGlwS4OyJ5x6-QmpPA_Q1gvsIZB9EZrb9zWX6qyA0LMQklz3IupBfINPVnpsMZ";
 const ERROR_DISCORD_WEBHOOK_URL: &str = "https://discord.com/api/webhooks/1475092817654055084/_mr0tTCdzyyoJtTBwNqE6KYj6SQ0XEegZFv4j5PejJ0vq2i1Vlt0oi7IFmeAt12j0TQW";
 const DETECTION_COOLDOWN_MS: i64 = 5_000; // 5 seconds — prevent rapid sequential trades
+/// Stop looking for arb opportunities this many seconds before the window closes.
+/// Near the close, the order book drains and Polymarket rejects one or both legs,
+/// resulting in the "REST book asks sum >= 100c" stale-signal error.
+const WINDOW_CLOSE_CUTOFF_SECS: i64 = 30;
 
 const PRIVATE_KEY_ENV: &str = "PRIVATE_KEY";
 
@@ -108,6 +112,7 @@ struct MarketState {
     asset_to_outcome: HashMap<String, String>,
     candles: HashMap<String, Candle>,
     fee_bps: u64, // maker fee in basis points, fetched from /markets/fee-rate
+    end_ts: i64,  // unix timestamp when this 5-minute window closes
 }
 
 struct MoneyManager {
@@ -245,6 +250,11 @@ const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args: Vec<String> = env::args().collect();
+    if args.iter().any(|a| a == "--scan") {
+        return scan_all_markets().await;
+    }
+
     if let Err(err) = run().await {
         let log = format!("{:#}", &err);
         eprintln!("FATAL ERROR: {log}");
@@ -358,6 +368,7 @@ async fn run() -> Result<()> {
             .collect(),
         candles: HashMap::new(),
         fee_bps: 1000, // sensible default until first fetch
+        end_ts: market.end_ts,
     }));
 
     // Background task: refresh fee rate every second without blocking the main loop
@@ -481,6 +492,7 @@ async fn run() -> Result<()> {
                         .collect();
                     guard.candles.clear();
                     guard.fee_bps = 1000; // reset to safe default until live fetch completes
+                    guard.end_ts = new_market.end_ts;
                 }
 
                 // Snapshot balance for profit tracking at window close
@@ -609,6 +621,202 @@ async fn run() -> Result<()> {
             }
         }
     }
+}
+
+// ── Market Scanner ────────────────────────────────────────────────────────────
+//
+// Fetches ALL active binary markets from Polymarket's Gamma API and checks each
+// one for arbitrage opportunities by comparing CLOB order book best-ask prices.
+// A market is flagged when (best_ask_outcome_1 + best_ask_outcome_2) < 100c,
+// meaning you can buy both sides for less than the guaranteed $1.00 payout.
+
+/// Scans all active Polymarket events for binary (YES/NO or UP/DOWN) arbitrage.
+async fn scan_all_markets() -> Result<()> {
+    eprintln!("=== Polymarket Arbitrage Scanner ===");
+    eprintln!("Fetching all active events...\n");
+
+    let client = Client::new();
+    let mut offset = 0u64;
+    let limit = 100u64;
+    let mut total_markets = 0u64;
+    let mut total_binary = 0u64;
+    let mut opportunities: Vec<(String, String, f64, f64, f64, f64, f64)> = Vec::new();
+
+    loop {
+        let url = format!(
+            "{GAMMA_API}/events?active=true&closed=false&limit={limit}&offset={offset}"
+        );
+        let resp = client.get(&url).send().await.context("fetch events page")?;
+        let events: Vec<Value> = resp.json().await.context("parse events response")?;
+
+        if events.is_empty() {
+            break;
+        }
+
+        for event in &events {
+            let event_title = event
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(untitled)");
+
+            let markets = match event.get("markets").and_then(|v| v.as_array()) {
+                Some(m) => m,
+                None => continue,
+            };
+
+            for market in markets {
+                total_markets += 1;
+
+                let question = market
+                    .get("question")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(no question)");
+                let active = market
+                    .get("active")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let closed = market
+                    .get("closed")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+
+                if !active || closed {
+                    continue;
+                }
+
+                // Parse outcomes and token IDs
+                let outcomes = match parse_string_array(market.get("outcomes")) {
+                    Ok(o) => o,
+                    Err(_) => continue,
+                };
+                let token_ids = match parse_string_array(market.get("clobTokenIds")) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+
+                // Only binary markets: YES/NO or UP/DOWN
+                if outcomes.len() != 2 || token_ids.len() != 2 {
+                    continue;
+                }
+
+                let o1 = outcomes[0].to_uppercase();
+                let o2 = outcomes[1].to_uppercase();
+                let is_binary = (o1 == "YES" && o2 == "NO")
+                    || (o1 == "NO" && o2 == "YES")
+                    || (o1 == "UP" && o2 == "DOWN")
+                    || (o1 == "DOWN" && o2 == "UP");
+
+                if !is_binary {
+                    continue;
+                }
+
+                total_binary += 1;
+
+                // Fetch CLOB order books for both tokens
+                let (book1, book2) = tokio::join!(
+                    get_order_book(&client, &token_ids[0]),
+                    get_order_book(&client, &token_ids[1]),
+                );
+
+                let book1 = match book1 {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                let book2 = match book2 {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+
+                let ask1: Option<f64> = book1.asks.first().and_then(|l| l.price.parse().ok());
+                let ask2: Option<f64> = book2.asks.first().and_then(|l| l.price.parse().ok());
+
+                let (a1, a2) = match (ask1, ask2) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => continue, // no liquidity on one side
+                };
+
+                let sum = a1 + a2;
+                let sum_cents = sum * 100.0;
+
+                // Get depth for display
+                let depth1 = book1
+                    .asks
+                    .first()
+                    .and_then(|l| l.size.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                let depth2 = book2
+                    .asks
+                    .first()
+                    .and_then(|l| l.size.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+
+                if sum_cents < 100.0 {
+                    let edge = 100.0 - sum_cents;
+                    opportunities.push((
+                        event_title.to_string(),
+                        question.to_string(),
+                        a1 * 100.0,
+                        a2 * 100.0,
+                        sum_cents,
+                        edge,
+                        depth1.min(depth2),
+                    ));
+                    eprintln!(
+                        "  ARB FOUND: {} | {:.1}c + {:.1}c = {:.1}c (edge +{:.1}c) | depth: {:.0}",
+                        question,
+                        a1 * 100.0,
+                        a2 * 100.0,
+                        sum_cents,
+                        edge,
+                        depth1.min(depth2),
+                    );
+                }
+
+                // Rate limit: ~5 requests per second (2 per market)
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+
+        offset += limit;
+        eprintln!(
+            "  ... scanned {} events so far ({} markets, {} binary)",
+            offset,
+            total_markets,
+            total_binary,
+        );
+    }
+
+    // ── Summary ──────────────────────────────────────────────────────────────
+    eprintln!("\n=== Scan Complete ===");
+    eprintln!(
+        "Total markets: {} | Binary (YES/NO or UP/DOWN): {}",
+        total_markets, total_binary
+    );
+
+    if opportunities.is_empty() {
+        eprintln!("No arbitrage opportunities found.");
+    } else {
+        opportunities.sort_by(|a, b| b.5.partial_cmp(&a.5).unwrap_or(std::cmp::Ordering::Equal));
+        eprintln!("\n{} ARBITRAGE OPPORTUNITIES:\n", opportunities.len());
+        eprintln!(
+            "{:<60} {:>8} {:>8} {:>8} {:>8} {:>8}",
+            "Market", "Ask1(c)", "Ask2(c)", "Sum(c)", "Edge(c)", "Depth"
+        );
+        eprintln!("{}", "-".repeat(112));
+        for (_, question, a1, a2, sum, edge, depth) in &opportunities {
+            let q = if question.len() > 58 {
+                format!("{}...", &question[..55])
+            } else {
+                question.clone()
+            };
+            eprintln!(
+                "{:<60} {:>8.1} {:>8.1} {:>8.1} {:>+8.1} {:>8.0}",
+                q, a1, a2, sum, edge, depth
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn compute_current_slug() -> (String, i64) {
@@ -1023,6 +1231,19 @@ async fn print_up_down(
         };
 
         if sum_cents < profit_threshold {
+            // ── Window-close cutoff ──────────────────────────────────
+            // In the last N seconds before the window closes, the order book
+            // drains and Polymarket locks one side.  Any "arb" signal here is
+            // a phantom — one or both legs will be rejected.  Skip early.
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            let secs_left = state.end_ts - now_secs;
+            if secs_left <= WINDOW_CLOSE_CUTOFF_SECS {
+                return Ok(());
+            }
+
             // ── Cooldown gate ────────────────────────────────────────
             let now = now_ms();
             let last = LAST_DETECTION_MS.load(Ordering::Relaxed);
