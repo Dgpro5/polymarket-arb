@@ -781,12 +781,13 @@ async fn scan_all_markets() -> Result<()> {
                     Err(_) => continue,
                 };
 
-                let bid1: Option<f64> = book1.bids.first().and_then(|l| l.price.parse().ok());
-                let bid2: Option<f64> = book2.bids.first().and_then(|l| l.price.parse().ok());
                 let ask1: Option<f64> = book1.asks.first().and_then(|l| l.price.parse().ok());
                 let ask2: Option<f64> = book2.asks.first().and_then(|l| l.price.parse().ok());
+                let bid1: Option<f64> = book1.bids.first().and_then(|l| l.price.parse().ok());
+                let bid2: Option<f64> = book2.bids.first().and_then(|l| l.price.parse().ok());
 
-                let (b1, b2) = match (bid1, bid2) {
+                // Need asks on both sides — that's what we pay with FAK
+                let (a1, a2) = match (ask1, ask2) {
                     (Some(a), Some(b)) => (a, b),
                     _ => {
                         total_no_liquidity += 1;
@@ -794,55 +795,57 @@ async fn scan_all_markets() -> Result<()> {
                     }
                 };
 
-                let bid_sum = b1 + b2;
-                let bid_sum_cents = bid_sum * 100.0;
-                let ask_sum_cents = match (ask1, ask2) {
-                    (Some(a1), Some(a2)) => (a1 + a2) * 100.0,
+                let ask_sum = a1 + a2;
+                let ask_sum_cents = ask_sum * 100.0;
+                let bid_sum_cents = match (bid1, bid2) {
+                    (Some(b1), Some(b2)) => (b1 + b2) * 100.0,
                     _ => f64::NAN,
                 };
 
-                // Get depth for display (bid-side depth)
+                // Get depth for display (ask-side depth — what we can buy)
                 let depth1 = book1
-                    .bids
+                    .asks
                     .first()
                     .and_then(|l| l.size.parse::<f64>().ok())
                     .unwrap_or(0.0);
                 let depth2 = book2
-                    .bids
+                    .asks
                     .first()
                     .and_then(|l| l.size.parse::<f64>().ok())
                     .unwrap_or(0.0);
 
-                if bid_sum_cents < 100.0 {
-                    let edge = 100.0 - bid_sum_cents;
+                // Arb exists when best_ask_1 + best_ask_2 < 100c
+                // (i.e. we can BUY both sides for less than the $1 payout)
+                if ask_sum_cents < 100.0 {
+                    let edge = 100.0 - ask_sum_cents;
                     opportunities.push((
                         event_title.to_string(),
                         question.to_string(),
-                        b1 * 100.0,
-                        b2 * 100.0,
-                        bid_sum_cents,
+                        a1 * 100.0,
+                        a2 * 100.0,
+                        ask_sum_cents,
                         edge,
                         depth1.min(depth2),
                     ));
                     eprintln!(
-                        "  ARB FOUND: {} | bid: {:.1}c + {:.1}c = {:.1}c (edge +{:.1}c) | ask: {:.1}c | depth: {:.0}",
+                        "  ARB FOUND: {} | ask: {:.1}c + {:.1}c = {:.1}c (edge +{:.1}c) | bid sum: {:.1}c | depth: {:.0}",
                         question,
-                        b1 * 100.0,
-                        b2 * 100.0,
-                        bid_sum_cents,
-                        edge,
+                        a1 * 100.0,
+                        a2 * 100.0,
                         ask_sum_cents,
+                        edge,
+                        bid_sum_cents,
                         depth1.min(depth2),
                     );
                 } else {
                     total_no_arb += 1;
                     eprintln!(
-                        "  NO ARB: {} | bid: {:.1}c + {:.1}c = {:.1}c | ask: {:.1}c",
+                        "  NO ARB: {} | ask: {:.1}c + {:.1}c = {:.1}c | bid sum: {:.1}c",
                         question,
-                        b1 * 100.0,
-                        b2 * 100.0,
-                        bid_sum_cents,
+                        a1 * 100.0,
+                        a2 * 100.0,
                         ask_sum_cents,
+                        bid_sum_cents,
                     );
                 }
 
@@ -874,7 +877,7 @@ async fn scan_all_markets() -> Result<()> {
         eprintln!("\n{} ARBITRAGE OPPORTUNITIES:\n", opportunities.len());
         eprintln!(
             "{:<60} {:>8} {:>8} {:>8} {:>8} {:>8}",
-            "Market", "Bid1(c)", "Bid2(c)", "Sum(c)", "Edge(c)", "Depth"
+            "Market", "Ask1(c)", "Ask2(c)", "Sum(c)", "Edge(c)", "Depth"
         );
         eprintln!("{}", "-".repeat(112));
         for (_, question, a1, a2, sum, edge, depth) in &opportunities {
@@ -1385,7 +1388,7 @@ async fn print_up_down(
                         )
                     };
                     let embed = json!({
-                        "title": "Trade Executed (GTC Bid)",
+                        "title": "Trade Executed (Batch FAK)",
                         "color": 0x2ECC71,
                         "fields": [
                             { "name": "UP Price", "value": format!("{:.2}c", up * 100.0), "inline": true },
@@ -1496,10 +1499,10 @@ struct TradeDetails {
     down_filled: u64,
 }
 
-/// Determine how many shares an order actually filled.
+/// Determine how many shares a FAK order actually filled.
 /// Polls the order status endpoint (with retries) for the exact fill size.
 /// Falls back to computing from `takingAmount` if the poll doesn't return data.
-/// NEVER blindly returns `requested_shares` — fills can exceed or undershoot
+/// NEVER blindly returns `requested_shares` — FAK fills can exceed or undershoot
 /// the requested amount depending on market price vs limit price.
 async fn determine_fill_shares(
     client: &Client,
@@ -1512,7 +1515,7 @@ async fn determine_fill_shares(
         return 0;
     }
 
-    // If status is empty AND no order ID, the order matched nothing.
+    // If status is empty AND no order ID, the FAK matched nothing.
     if res.status.is_empty() && res.order_id.is_empty() {
         return 0;
     }
@@ -1582,10 +1585,10 @@ async fn determine_fill_shares(
     0
 }
 
-/// Places UP and DOWN orders simultaneously via batch GTC (limit) submission.
+/// Places UP and DOWN orders simultaneously via batch FAK submission.
 /// Both orders are pre-built and signed, then submitted in a single HTTP
-/// request to minimize the timing gap.  Orders are placed at the best bid
-/// price (maker) instead of crossing the ask (taker) for better pricing.
+/// request to minimize the timing gap.  FAK allows partial fills — any
+/// mismatch between legs is resolved by selling back the excess.
 async fn execute_arbitrage_trade(
     wallet: &Arc<TradingWallet>,
     up_asset_id: &str,
@@ -1613,55 +1616,52 @@ async fn execute_arbitrage_trade(
 
     // ── Order book (REST) — depth sizing + liquidity verification ───────
     let up_book = get_order_book(&client, up_asset_id).await?;
-    let _up_bid_depth = calculate_total_size(&up_book.bids)?;
+    let up_depth = calculate_total_size(&up_book.asks)?;
     let down_book = get_order_book(&client, down_asset_id).await?;
-    let _down_bid_depth = calculate_total_size(&down_book.bids)?;
+    let down_depth = calculate_total_size(&down_book.asks)?;
 
-    // We place limit buy orders at the best bid price (maker orders).
-    // Verify both sides have bids we can join.
-    let up_best_bid: Option<f64> = up_book.bids.first().and_then(|l| l.price.parse().ok());
-    let down_best_bid: Option<f64> = down_book.bids.first().and_then(|l| l.price.parse().ok());
+    // Verify both sides have actual ask liquidity on the REST book.
+    // If one side is empty, FAK will get zero fills → one-sided exposure.
     let up_best_ask: Option<f64> = up_book.asks.first().and_then(|l| l.price.parse().ok());
     let down_best_ask: Option<f64> = down_book.asks.first().and_then(|l| l.price.parse().ok());
 
-    if up_best_bid.is_none() || down_best_bid.is_none() {
+    if up_best_ask.is_none() || down_best_ask.is_none() {
         return Err(anyhow!(
-            "No bid liquidity on REST book — UP: {} DOWN: {}. Skipping.",
-            if up_best_bid.is_some() { "OK" } else { "EMPTY" },
-            if down_best_bid.is_some() { "OK" } else { "EMPTY" },
+            "No ask liquidity on REST book — UP: {} DOWN: {}. Skipping to avoid one-sided fill.",
+            if up_best_ask.is_some() { "OK" } else { "EMPTY" },
+            if down_best_ask.is_some() { "OK" } else { "EMPTY" },
         ));
     }
 
-    let up_bid_price = up_best_bid.unwrap();
-    let down_bid_price = down_best_bid.unwrap();
-    let bid_sum = up_bid_price + down_bid_price;
+    let up_book_price = up_best_ask.unwrap();
+    let down_book_price = down_best_ask.unwrap();
+    let book_sum = up_book_price + down_book_price;
 
-    // Validate the arb using bid prices.  If best_bid_1 + best_bid_2 >= 1.0
-    // then joining the bids gives no edge — we'd pay >= 100c total.
-    if bid_sum >= 1.0 {
+    // Validate the arb against the REAL order book ask prices (what we
+    // actually pay with FAK).  The WS can report stale/phantom prices
+    // while the actual book has different asks.  No real arb exists if
+    // best_ask_1 + best_ask_2 >= 100c.
+    if book_sum >= 1.0 {
         return Err(anyhow!(
-            "REST book bids sum to {:.2}c (UP {:.2}c + DOWN {:.2}c) >= 100c. No arb at bid.",
-            bid_sum * 100.0, up_bid_price * 100.0, down_bid_price * 100.0
+            "REST book asks sum to {:.2}c (UP {:.2}c + DOWN {:.2}c) >= 100c. No real arb at the spread.",
+            book_sum * 100.0, up_book_price * 100.0, down_book_price * 100.0
         ));
     }
 
-    // Use ask-side depth as a rough proxy for how much can trade
-    let up_ask_depth = calculate_total_size(&up_book.asks).unwrap_or(0.0);
-    let down_ask_depth = calculate_total_size(&down_book.asks).unwrap_or(0.0);
-    let liquidity_shares = (up_ask_depth.min(down_ask_depth) * 0.5).floor();
+    // Take 50% of the thinner side's depth — smaller orders fill more reliably
+    let liquidity_shares = (up_depth.min(down_depth) * 0.5).floor();
 
-    // ── Pricing: place limit buy at the best bid (maker order) ───────
-    // By joining the bid we get better pricing than crossing the ask.
-    // The order sits on the book until someone sells into us.
-    let up_order_price = up_bid_price;
-    let down_order_price = down_bid_price;
+    // ── Pricing: REST book best ask + 1c buffer as FAK limit price ───────
+    // Use the REST book price (not WS) for the limit — this is the actual
+    // price we can fill at.  The +1c buffer absorbs minor drift.
+    let up_order_price = ((up_book_price + 0.01) * 100.0).ceil() / 100.0;
+    let down_order_price = ((down_book_price + 0.01) * 100.0).ceil() / 100.0;
 
     eprintln!(
-        "Pricing — WS ask: UP={:.2}c DOWN={:.2}c | Book bid: UP={:.2}c DOWN={:.2}c | Book ask: UP={:.2}c DOWN={:.2}c | depth: UP={:.0} DOWN={:.0}",
+        "Pricing — WS ask: UP={:.2}c DOWN={:.2}c | Book ask: UP={:.2}c DOWN={:.2}c (+1c) | depth: UP={:.0} DOWN={:.0}",
         up_ask * 100.0, down_ask * 100.0,
-        up_bid_price * 100.0, down_bid_price * 100.0,
-        up_best_ask.unwrap_or(0.0) * 100.0, down_best_ask.unwrap_or(0.0) * 100.0,
-        up_ask_depth, down_ask_depth
+        up_book_price * 100.0, down_book_price * 100.0,
+        up_depth, down_depth
     );
 
     let cost_per_pair = up_order_price + down_order_price;
@@ -1690,25 +1690,25 @@ async fn execute_arbitrage_trade(
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  PHASE 1: Pre-build & sign BOTH orders as GTC limit buys at the bid.
+    //  PHASE 1: Pre-build & sign BOTH orders as FAK before sending.
     //  No network calls between the two signs — eliminates signing delay.
-    //  Uses REST book bid prices — orders sit on the book as maker orders.
+    //  Uses REST book ask prices so maker_amount accurately reflects the cost.
     // ═══════════════════════════════════════════════════════════════════════
     let up_salt = now_ms() as u64;
     let down_salt = up_salt + 1;
 
     eprintln!(
-        "Building GTC limit orders — {} shares × UP {:.2}c + DOWN {:.2}c = {:.2}c/pair, est ${:.4}",
+        "Building FAK orders — {} shares × UP {:.2}c + DOWN {:.2}c = {:.2}c/pair, est ${:.4}",
         buy_shares, up_order_price * 100.0, down_order_price * 100.0,
         cost_per_pair * 100.0, cost_per_pair * buy_shares as f64
     );
 
     let up_order = build_order_request(
-        wallet, up_asset_id, buy_shares, up_order_price, "BUY", fee_bps, up_salt, "GTC", 0,
+        wallet, up_asset_id, buy_shares, up_order_price, "BUY", fee_bps, up_salt, "FAK", 0,
     )
     .await?;
     let down_order = build_order_request(
-        wallet, down_asset_id, buy_shares, down_order_price, "BUY", fee_bps, down_salt, "GTC", 0,
+        wallet, down_asset_id, buy_shares, down_order_price, "BUY", fee_bps, down_salt, "FAK", 0,
     )
     .await?;
 
@@ -1743,7 +1743,7 @@ async fn execute_arbitrage_trade(
 
     // ═══════════════════════════════════════════════════════════════════════
     //  PHASE 3: Determine actual fill sizes for both legs.
-    //  GTC orders may partially fill — we need exact numbers.
+    //  FAK can partially fill — we need exact numbers.
     //  Wait briefly for matching engine to finalize, then poll both in parallel.
     // ═══════════════════════════════════════════════════════════════════════
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1766,7 +1766,7 @@ async fn execute_arbitrage_trade(
     // Both legs got nothing — no capital committed
     if matched == 0 && up_filled == 0 && down_filled == 0 {
         return Err(anyhow!(
-            "Both GTC orders unfilled. UP: {} | DOWN: {}",
+            "Both FAK orders unfilled. UP: {} | DOWN: {}",
             up_res.error_msg,
             down_res.error_msg
         ));
@@ -1835,8 +1835,8 @@ async fn execute_arbitrage_trade(
             down_status: down_res.status.clone(),
             up_fee_bps: fee_bps,
             down_fee_bps: fee_bps,
-            up_depth: up_ask_depth,
-            down_depth: down_ask_depth,
+            up_depth,
+            down_depth,
             requested_shares: buy_shares,
             up_filled,
             down_filled,
