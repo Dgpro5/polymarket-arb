@@ -1405,6 +1405,12 @@ async fn run_hot_market_ws(
         .await
         .context("hot-market WS subscribe")?;
 
+    eprintln!(
+        "Hot-market WS: connected and subscribed to {} assets across {} markets",
+        asset_ids.len(),
+        watched.len(),
+    );
+
     // Build a lookup table: asset_id → HotAssetState.
     let mut assets: HashMap<String, HotAssetState> = HashMap::new();
     for m in watched {
