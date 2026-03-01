@@ -781,10 +781,12 @@ async fn scan_all_markets() -> Result<()> {
                     Err(_) => continue,
                 };
 
+                let bid1: Option<f64> = book1.bids.first().and_then(|l| l.price.parse().ok());
+                let bid2: Option<f64> = book2.bids.first().and_then(|l| l.price.parse().ok());
                 let ask1: Option<f64> = book1.asks.first().and_then(|l| l.price.parse().ok());
                 let ask2: Option<f64> = book2.asks.first().and_then(|l| l.price.parse().ok());
 
-                let (a1, a2) = match (ask1, ask2) {
+                let (b1, b2) = match (bid1, bid2) {
                     (Some(a), Some(b)) => (a, b),
                     _ => {
                         total_no_liquidity += 1;
@@ -792,49 +794,55 @@ async fn scan_all_markets() -> Result<()> {
                     }
                 };
 
-                let sum = a1 + a2;
-                let sum_cents = sum * 100.0;
+                let bid_sum = b1 + b2;
+                let bid_sum_cents = bid_sum * 100.0;
+                let ask_sum_cents = match (ask1, ask2) {
+                    (Some(a1), Some(a2)) => (a1 + a2) * 100.0,
+                    _ => f64::NAN,
+                };
 
-                // Get depth for display
+                // Get depth for display (bid-side depth)
                 let depth1 = book1
-                    .asks
+                    .bids
                     .first()
                     .and_then(|l| l.size.parse::<f64>().ok())
                     .unwrap_or(0.0);
                 let depth2 = book2
-                    .asks
+                    .bids
                     .first()
                     .and_then(|l| l.size.parse::<f64>().ok())
                     .unwrap_or(0.0);
 
-                if sum_cents < 100.0 {
-                    let edge = 100.0 - sum_cents;
+                if bid_sum_cents < 100.0 {
+                    let edge = 100.0 - bid_sum_cents;
                     opportunities.push((
                         event_title.to_string(),
                         question.to_string(),
-                        a1 * 100.0,
-                        a2 * 100.0,
-                        sum_cents,
+                        b1 * 100.0,
+                        b2 * 100.0,
+                        bid_sum_cents,
                         edge,
                         depth1.min(depth2),
                     ));
                     eprintln!(
-                        "  ARB FOUND: {} | {:.1}c + {:.1}c = {:.1}c (edge +{:.1}c) | depth: {:.0}",
+                        "  ARB FOUND: {} | bid: {:.1}c + {:.1}c = {:.1}c (edge +{:.1}c) | ask: {:.1}c | depth: {:.0}",
                         question,
-                        a1 * 100.0,
-                        a2 * 100.0,
-                        sum_cents,
+                        b1 * 100.0,
+                        b2 * 100.0,
+                        bid_sum_cents,
                         edge,
+                        ask_sum_cents,
                         depth1.min(depth2),
                     );
                 } else {
                     total_no_arb += 1;
                     eprintln!(
-                        "  NO ARB: {} | {:.1}c + {:.1}c = {:.1}c",
+                        "  NO ARB: {} | bid: {:.1}c + {:.1}c = {:.1}c | ask: {:.1}c",
                         question,
-                        a1 * 100.0,
-                        a2 * 100.0,
-                        sum_cents,
+                        b1 * 100.0,
+                        b2 * 100.0,
+                        bid_sum_cents,
+                        ask_sum_cents,
                     );
                 }
 
@@ -866,7 +874,7 @@ async fn scan_all_markets() -> Result<()> {
         eprintln!("\n{} ARBITRAGE OPPORTUNITIES:\n", opportunities.len());
         eprintln!(
             "{:<60} {:>8} {:>8} {:>8} {:>8} {:>8}",
-            "Market", "Ask1(c)", "Ask2(c)", "Sum(c)", "Edge(c)", "Depth"
+            "Market", "Bid1(c)", "Bid2(c)", "Sum(c)", "Edge(c)", "Depth"
         );
         eprintln!("{}", "-".repeat(112));
         for (_, question, a1, a2, sum, edge, depth) in &opportunities {
@@ -1377,7 +1385,7 @@ async fn print_up_down(
                         )
                     };
                     let embed = json!({
-                        "title": "Trade Executed (Batch FAK)",
+                        "title": "Trade Executed (GTC Bid)",
                         "color": 0x2ECC71,
                         "fields": [
                             { "name": "UP Price", "value": format!("{:.2}c", up * 100.0), "inline": true },
@@ -1488,10 +1496,10 @@ struct TradeDetails {
     down_filled: u64,
 }
 
-/// Determine how many shares a FAK order actually filled.
+/// Determine how many shares an order actually filled.
 /// Polls the order status endpoint (with retries) for the exact fill size.
 /// Falls back to computing from `takingAmount` if the poll doesn't return data.
-/// NEVER blindly returns `requested_shares` — FAK fills can exceed or undershoot
+/// NEVER blindly returns `requested_shares` — fills can exceed or undershoot
 /// the requested amount depending on market price vs limit price.
 async fn determine_fill_shares(
     client: &Client,
@@ -1504,7 +1512,7 @@ async fn determine_fill_shares(
         return 0;
     }
 
-    // If status is empty AND no order ID, the FAK matched nothing.
+    // If status is empty AND no order ID, the order matched nothing.
     if res.status.is_empty() && res.order_id.is_empty() {
         return 0;
     }
@@ -1574,10 +1582,10 @@ async fn determine_fill_shares(
     0
 }
 
-/// Places UP and DOWN orders simultaneously via batch FAK submission.
+/// Places UP and DOWN orders simultaneously via batch GTC (limit) submission.
 /// Both orders are pre-built and signed, then submitted in a single HTTP
-/// request to minimize the timing gap.  FAK allows partial fills — any
-/// mismatch between legs is resolved by selling back the excess.
+/// request to minimize the timing gap.  Orders are placed at the best bid
+/// price (maker) instead of crossing the ask (taker) for better pricing.
 async fn execute_arbitrage_trade(
     wallet: &Arc<TradingWallet>,
     up_asset_id: &str,
@@ -1605,51 +1613,55 @@ async fn execute_arbitrage_trade(
 
     // ── Order book (REST) — depth sizing + liquidity verification ───────
     let up_book = get_order_book(&client, up_asset_id).await?;
-    let up_depth = calculate_total_size(&up_book.asks)?;
+    let _up_bid_depth = calculate_total_size(&up_book.bids)?;
     let down_book = get_order_book(&client, down_asset_id).await?;
-    let down_depth = calculate_total_size(&down_book.asks)?;
+    let _down_bid_depth = calculate_total_size(&down_book.bids)?;
 
-    // Verify both sides have actual ask liquidity on the REST book.
-    // If one side is empty, FAK will get zero fills → one-sided exposure.
+    // We place limit buy orders at the best bid price (maker orders).
+    // Verify both sides have bids we can join.
+    let up_best_bid: Option<f64> = up_book.bids.first().and_then(|l| l.price.parse().ok());
+    let down_best_bid: Option<f64> = down_book.bids.first().and_then(|l| l.price.parse().ok());
     let up_best_ask: Option<f64> = up_book.asks.first().and_then(|l| l.price.parse().ok());
     let down_best_ask: Option<f64> = down_book.asks.first().and_then(|l| l.price.parse().ok());
 
-    if up_best_ask.is_none() || down_best_ask.is_none() {
+    if up_best_bid.is_none() || down_best_bid.is_none() {
         return Err(anyhow!(
-            "No ask liquidity on REST book — UP: {} DOWN: {}. Skipping to avoid one-sided fill.",
-            if up_best_ask.is_some() { "OK" } else { "EMPTY" },
-            if down_best_ask.is_some() { "OK" } else { "EMPTY" },
+            "No bid liquidity on REST book — UP: {} DOWN: {}. Skipping.",
+            if up_best_bid.is_some() { "OK" } else { "EMPTY" },
+            if down_best_bid.is_some() { "OK" } else { "EMPTY" },
         ));
     }
 
-    let up_book_price = up_best_ask.unwrap();
-    let down_book_price = down_best_ask.unwrap();
-    let book_sum = up_book_price + down_book_price;
+    let up_bid_price = up_best_bid.unwrap();
+    let down_bid_price = down_best_bid.unwrap();
+    let bid_sum = up_bid_price + down_bid_price;
 
-    // Validate the arb against the REAL order book, not the WS.
-    // The WS can report stale/phantom prices (e.g. 12c+78c=90c) while
-    // the actual book has asks at 99c+99c.  No real arb exists there.
-    if book_sum >= 1.0 {
+    // Validate the arb using bid prices.  If best_bid_1 + best_bid_2 >= 1.0
+    // then joining the bids gives no edge — we'd pay >= 100c total.
+    if bid_sum >= 1.0 {
         return Err(anyhow!(
-            "REST book asks sum to {:.2}c (UP {:.2}c + DOWN {:.2}c) >= 100c. WS signal is stale — no real arb.",
-            book_sum * 100.0, up_book_price * 100.0, down_book_price * 100.0
+            "REST book bids sum to {:.2}c (UP {:.2}c + DOWN {:.2}c) >= 100c. No arb at bid.",
+            bid_sum * 100.0, up_bid_price * 100.0, down_bid_price * 100.0
         ));
     }
 
-    // Take 50% of the thinner side's depth — smaller orders fill more reliably
-    let liquidity_shares = (up_depth.min(down_depth) * 0.5).floor();
+    // Use ask-side depth as a rough proxy for how much can trade
+    let up_ask_depth = calculate_total_size(&up_book.asks).unwrap_or(0.0);
+    let down_ask_depth = calculate_total_size(&down_book.asks).unwrap_or(0.0);
+    let liquidity_shares = (up_ask_depth.min(down_ask_depth) * 0.5).floor();
 
-    // ── Pricing: REST book best ask + 1c buffer as FAK limit price ───────
-    // Use the REST book price (not WS) for the limit — this is the actual
-    // price we can fill at.  The +1c buffer absorbs minor drift.
-    let up_order_price = ((up_book_price + 0.01) * 100.0).ceil() / 100.0;
-    let down_order_price = ((down_book_price + 0.01) * 100.0).ceil() / 100.0;
+    // ── Pricing: place limit buy at the best bid (maker order) ───────
+    // By joining the bid we get better pricing than crossing the ask.
+    // The order sits on the book until someone sells into us.
+    let up_order_price = up_bid_price;
+    let down_order_price = down_bid_price;
 
     eprintln!(
-        "Pricing — WS ask: UP={:.2}c DOWN={:.2}c | Book ask: UP={:.2}c DOWN={:.2}c (+1c) | depth: UP={:.0} DOWN={:.0}",
+        "Pricing — WS ask: UP={:.2}c DOWN={:.2}c | Book bid: UP={:.2}c DOWN={:.2}c | Book ask: UP={:.2}c DOWN={:.2}c | depth: UP={:.0} DOWN={:.0}",
         up_ask * 100.0, down_ask * 100.0,
-        up_book_price * 100.0, down_book_price * 100.0,
-        up_depth, down_depth
+        up_bid_price * 100.0, down_bid_price * 100.0,
+        up_best_ask.unwrap_or(0.0) * 100.0, down_best_ask.unwrap_or(0.0) * 100.0,
+        up_ask_depth, down_ask_depth
     );
 
     let cost_per_pair = up_order_price + down_order_price;
@@ -1678,25 +1690,25 @@ async fn execute_arbitrage_trade(
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  PHASE 1: Pre-build & sign BOTH orders as FAK before sending.
+    //  PHASE 1: Pre-build & sign BOTH orders as GTC limit buys at the bid.
     //  No network calls between the two signs — eliminates signing delay.
-    //  Uses REST book prices so maker_amount accurately reflects the cost.
+    //  Uses REST book bid prices — orders sit on the book as maker orders.
     // ═══════════════════════════════════════════════════════════════════════
     let up_salt = now_ms() as u64;
     let down_salt = up_salt + 1;
 
     eprintln!(
-        "Building orders — {} shares × UP {:.2}c + DOWN {:.2}c = {:.2}c/pair, est ${:.4}",
+        "Building GTC limit orders — {} shares × UP {:.2}c + DOWN {:.2}c = {:.2}c/pair, est ${:.4}",
         buy_shares, up_order_price * 100.0, down_order_price * 100.0,
         cost_per_pair * 100.0, cost_per_pair * buy_shares as f64
     );
 
     let up_order = build_order_request(
-        wallet, up_asset_id, buy_shares, up_order_price, "BUY", fee_bps, up_salt, "FAK", 0,
+        wallet, up_asset_id, buy_shares, up_order_price, "BUY", fee_bps, up_salt, "GTC", 0,
     )
     .await?;
     let down_order = build_order_request(
-        wallet, down_asset_id, buy_shares, down_order_price, "BUY", fee_bps, down_salt, "FAK", 0,
+        wallet, down_asset_id, buy_shares, down_order_price, "BUY", fee_bps, down_salt, "GTC", 0,
     )
     .await?;
 
@@ -1731,7 +1743,7 @@ async fn execute_arbitrage_trade(
 
     // ═══════════════════════════════════════════════════════════════════════
     //  PHASE 3: Determine actual fill sizes for both legs.
-    //  FAK can partially fill — we need exact numbers.
+    //  GTC orders may partially fill — we need exact numbers.
     //  Wait briefly for matching engine to finalize, then poll both in parallel.
     // ═══════════════════════════════════════════════════════════════════════
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1754,7 +1766,7 @@ async fn execute_arbitrage_trade(
     // Both legs got nothing — no capital committed
     if matched == 0 && up_filled == 0 && down_filled == 0 {
         return Err(anyhow!(
-            "Both FAK orders unfilled. UP: {} | DOWN: {}",
+            "Both GTC orders unfilled. UP: {} | DOWN: {}",
             up_res.error_msg,
             down_res.error_msg
         ));
@@ -1823,8 +1835,8 @@ async fn execute_arbitrage_trade(
             down_status: down_res.status.clone(),
             up_fee_bps: fee_bps,
             down_fee_bps: fee_bps,
-            up_depth,
-            down_depth,
+            up_depth: up_ask_depth,
+            down_depth: down_ask_depth,
             requested_shares: buy_shares,
             up_filled,
             down_filled,
@@ -2003,7 +2015,22 @@ async fn get_order_book(client: &Client, token_id: &str) -> Result<OrderBook> {
     let url = format!("{CLOB_API}/book?token_id={}", token_id);
     let resp = client.get(&url).send().await.context("fetch order book")?;
 
-    let book: OrderBook = resp.json().await.context("parse order book")?;
+    let mut book: OrderBook = resp.json().await.context("parse order book")?;
+
+    // CLOB API returns asks in arbitrary/descending order — sort ascending so
+    // asks[0] is the cheapest (best) ask.  Sort bids descending so bids[0] is
+    // the highest (best) bid.
+    book.asks.sort_by(|a, b| {
+        let pa: f64 = a.price.parse().unwrap_or(f64::MAX);
+        let pb: f64 = b.price.parse().unwrap_or(f64::MAX);
+        pa.partial_cmp(&pb).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    book.bids.sort_by(|a, b| {
+        let pa: f64 = a.price.parse().unwrap_or(0.0);
+        let pb: f64 = b.price.parse().unwrap_or(0.0);
+        pb.partial_cmp(&pa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
     Ok(book)
 }
 
