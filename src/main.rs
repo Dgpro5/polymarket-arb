@@ -692,14 +692,18 @@ async fn scan_all_markets() -> Result<()> {
     let limit = 100u64;
     let mut total_markets = 0u64;
     let mut total_binary = 0u64;
-    let mut total_skipped_date = 0u64;
     let mut total_no_liquidity = 0u64;
     let mut total_no_arb = 0u64;
     let mut opportunities: Vec<(String, String, f64, f64, f64, f64, f64)> = Vec::new();
 
+    // Server-side date filter: only fetch events resolving within 7 days.
+    let now = chrono::Utc::now();
+    let end_date_min = now.format("%Y-%m-%d").to_string();
+    let end_date_max = (now + chrono::Duration::days(7)).format("%Y-%m-%d").to_string();
+
     loop {
         let url = format!(
-            "{GAMMA_API}/events?active=true&closed=false&limit={limit}&offset={offset}"
+            "{GAMMA_API}/events?active=true&closed=false&limit={limit}&offset={offset}&end_date_min={end_date_min}&end_date_max={end_date_max}"
         );
         let resp = client.get(&url).send().await.context("fetch events page")?;
         let events: Vec<Value> = resp.json().await.context("parse events response")?;
@@ -766,23 +770,6 @@ async fn scan_all_markets() -> Result<()> {
                 }
 
                 total_binary += 1;
-
-                // Only markets resolving within 7 days — skip long-dated ones
-                // whose books are wide and illiquid.
-                let within_window = match market.get("endDate").and_then(|v| v.as_str()) {
-                    Some(end_date_str) => match chrono::DateTime::parse_from_rfc3339(end_date_str) {
-                        Ok(end_dt) => {
-                            let days_until = end_dt.signed_duration_since(chrono::Utc::now()).num_days();
-                            days_until >= 0 && days_until <= 7
-                        }
-                        Err(_) => false,
-                    },
-                    None => false,
-                };
-                if !within_window {
-                    total_skipped_date += 1;
-                    continue;
-                }
 
                 // Fetch CLOB order books for both tokens
                 let (book1, book2) = tokio::join!(
@@ -884,8 +871,8 @@ async fn scan_all_markets() -> Result<()> {
     // ── Summary ──────────────────────────────────────────────────────────────
     eprintln!("\n=== Scan Complete ===");
     eprintln!(
-        "Total markets: {} | Binary: {} | Skipped (>7d): {} | No liquidity: {} | No arb: {} | Arb found: {}",
-        total_markets, total_binary, total_skipped_date, total_no_liquidity, total_no_arb, opportunities.len()
+        "Total markets: {} | Binary: {} | No liquidity: {} | No arb: {} | Arb found: {}",
+        total_markets, total_binary, total_no_liquidity, total_no_arb, opportunities.len()
     );
 
     if opportunities.is_empty() {
