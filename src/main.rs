@@ -692,6 +692,8 @@ async fn scan_all_markets() -> Result<()> {
     let limit = 100u64;
     let mut total_markets = 0u64;
     let mut total_binary = 0u64;
+    let mut total_no_liquidity = 0u64;
+    let mut total_no_arb = 0u64;
     let mut opportunities: Vec<(String, String, f64, f64, f64, f64, f64)> = Vec::new();
 
     loop {
@@ -784,7 +786,10 @@ async fn scan_all_markets() -> Result<()> {
 
                 let (a1, a2) = match (ask1, ask2) {
                     (Some(a), Some(b)) => (a, b),
-                    _ => continue, // no liquidity on one side
+                    _ => {
+                        total_no_liquidity += 1;
+                        continue;
+                    }
                 };
 
                 let sum = a1 + a2;
@@ -822,6 +827,15 @@ async fn scan_all_markets() -> Result<()> {
                         edge,
                         depth1.min(depth2),
                     );
+                } else {
+                    total_no_arb += 1;
+                    eprintln!(
+                        "  NO ARB: {} | {:.1}c + {:.1}c = {:.1}c",
+                        question,
+                        a1 * 100.0,
+                        a2 * 100.0,
+                        sum_cents,
+                    );
                 }
 
                 // Rate limit: ~5 requests per second (2 per market)
@@ -841,8 +855,8 @@ async fn scan_all_markets() -> Result<()> {
     // ── Summary ──────────────────────────────────────────────────────────────
     eprintln!("\n=== Scan Complete ===");
     eprintln!(
-        "Total markets: {} | Binary (YES/NO or UP/DOWN): {}",
-        total_markets, total_binary
+        "Total markets: {} | Binary (YES/NO or UP/DOWN): {} | No liquidity: {} | No arb: {} | Arb found: {}",
+        total_markets, total_binary, total_no_liquidity, total_no_arb, opportunities.len()
     );
 
     if opportunities.is_empty() {
