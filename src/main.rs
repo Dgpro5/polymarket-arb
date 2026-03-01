@@ -547,6 +547,31 @@ async fn run() -> Result<()> {
         }
     });
 
+    // Background task: refresh balance in money manager every 5 minutes.
+    // Keeps the cumulative stats accurate when both the WS loop and the
+    // background scanner are placing trades concurrently.
+    let balance_wallet = Arc::clone(&wallet);
+    let balance_money = Arc::clone(&money);
+    let balance_client = client.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(5 * 60));
+        ticker.tick().await; // skip first tick — balance was just fetched above
+        loop {
+            ticker.tick().await;
+            match get_balance(&balance_client, &balance_wallet.address).await {
+                Ok(bal) => {
+                    let mut m = balance_money.lock().await;
+                    m.balance_at_window_start = bal;
+                    m.money_spent = 0.0;
+                    m.total_buy_positions = 0;
+                    m.total_shares_bought = 0;
+                    eprintln!("Balance refreshed: ${:.4}", bal);
+                }
+                Err(e) => eprintln!("WARN: periodic balance refresh failed: {e:#}"),
+            }
+        }
+    });
+
     // Background task: continuously scan ALL markets for arb opportunities
     let scan_wallet = Arc::clone(&wallet);
     tokio::spawn(async move {
