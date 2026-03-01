@@ -313,8 +313,8 @@ async fn run() -> Result<()> {
         fs::write(REDEMPTIONS_PATH, "[]").context("create pending redemptions file")?;
     }
 
-    // Scan all active markets for arbitrage opportunities on startup
-    if let Err(e) = scan_all_markets().await {
+    // Scan all active markets for arbitrage opportunities on startup (no wallet yet)
+    if let Err(e) = scan_all_markets(None).await {
         eprintln!("Market scan failed (non-fatal): {e:#}");
     }
 
@@ -547,6 +547,45 @@ async fn run() -> Result<()> {
         }
     });
 
+    // Background task: refresh balance in money manager every 5 minutes.
+    // Keeps the cumulative stats accurate when both the WS loop and the
+    // background scanner are placing trades concurrently.
+    let balance_wallet = Arc::clone(&wallet);
+    let balance_money = Arc::clone(&money);
+    let balance_client = client.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(5 * 60));
+        ticker.tick().await; // skip first tick — balance was just fetched above
+        loop {
+            ticker.tick().await;
+            match get_balance(&balance_client, &balance_wallet.address).await {
+                Ok(bal) => {
+                    let mut m = balance_money.lock().await;
+                    m.balance_at_window_start = bal;
+                    m.money_spent = 0.0;
+                    m.total_buy_positions = 0;
+                    m.total_shares_bought = 0;
+                    eprintln!("Balance refreshed: ${:.4}", bal);
+                }
+                Err(e) => eprintln!("WARN: periodic balance refresh failed: {e:#}"),
+            }
+        }
+    });
+
+    // Background task: continuously scan ALL markets for arb opportunities
+    let scan_wallet = Arc::clone(&wallet);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(SCAN_INTERVAL_SECS));
+        ticker.tick().await; // first tick fires immediately — skip (startup scan already ran)
+        loop {
+            ticker.tick().await;
+            eprintln!("Background scanner: starting periodic scan...");
+            if let Err(e) = scan_all_markets(Some(&scan_wallet)).await {
+                eprintln!("Background scanner error: {e:#}");
+            }
+        }
+    });
+
     let mut backoff = 2u64;
     loop {
         match discover_active_btc_5m_market(&client).await {
@@ -682,8 +721,12 @@ async fn run() -> Result<()> {
 // A market is flagged when (best_ask_outcome_1 + best_ask_outcome_2) < 100c,
 // meaning you can buy both sides for less than the guaranteed $1.00 payout.
 
+/// How often the background scanner re-scans all markets (seconds).
+const SCAN_INTERVAL_SECS: u64 = 60;
+
 /// Scans all active Polymarket events for binary (YES/NO or UP/DOWN) arbitrage.
-async fn scan_all_markets() -> Result<()> {
+/// When `wallet` is provided, discovered opportunities are executed immediately.
+async fn scan_all_markets(wallet: Option<&Arc<TradingWallet>>) -> Result<()> {
     eprintln!("=== Polymarket Arbitrage Scanner ===");
     eprintln!("Fetching active events (resolving within 7 days)...\n");
 
@@ -842,16 +885,90 @@ async fn scan_all_markets() -> Result<()> {
                         bid_sum_cents,
                         depth1.min(depth2),
                     );
+
+                    // Execute trade if wallet is available
+                    if let Some(w) = wallet {
+                        let fee_bps = get_fee_rate(&client, &token_ids[0]).await.unwrap_or(1000);
+                        match execute_arbitrage_trade(
+                            w,
+                            &token_ids[0],
+                            &token_ids[1],
+                            a1,
+                            a2,
+                            a1,
+                            a2,
+                            ask_sum_cents,
+                            fee_bps,
+                        )
+                        .await
+                        {
+                            Ok((trade_result, details)) => {
+                                let slug = market
+                                    .get("slug")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
+                                let condition_id = market
+                                    .get("conditionId")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let end_ts = market
+                                    .get("endDate")
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                                    .map(|dt| dt.timestamp())
+                                    .unwrap_or(0);
+
+                                let fill_note = if details.up_filled == details.requested_shares
+                                    && details.down_filled == details.requested_shares
+                                {
+                                    "full fill".to_string()
+                                } else {
+                                    format!(
+                                        "partial — side1 {}/{}, side2 {}/{}",
+                                        details.up_filled, details.requested_shares,
+                                        details.down_filled, details.requested_shares
+                                    )
+                                };
+                                let embed = json!({
+                                    "title": "Scanner Trade Executed",
+                                    "color": 0x2ECC71,
+                                    "fields": [
+                                        { "name": "Market", "value": question, "inline": false },
+                                        { "name": "Ask 1", "value": format!("{:.2}c", a1 * 100.0), "inline": true },
+                                        { "name": "Ask 2", "value": format!("{:.2}c", a2 * 100.0), "inline": true },
+                                        { "name": "Sum / Edge", "value": format!("{:.2}c / +{:.2}c", ask_sum_cents, edge), "inline": true },
+                                        { "name": "Shares", "value": format!("{}", trade_result.shares_bought), "inline": true },
+                                        { "name": "Total Spent", "value": format!("${:.4}", trade_result.total_spent), "inline": true },
+                                        { "name": "Fill", "value": fill_note, "inline": true },
+                                        { "name": "Balance After", "value": format!("${:.4}", details.balance_after), "inline": true },
+                                    ],
+                                    "footer": { "text": slug }
+                                });
+                                if let Err(e) = send_discord_embed(embed).await {
+                                    eprintln!("Discord scanner trade embed failed: {e:#}");
+                                }
+
+                                if !condition_id.is_empty() {
+                                    add_pending_redemption(slug, condition_id, end_ts);
+                                }
+                            }
+                            Err(e) => {
+                                let log = format!("{:#}", e);
+                                eprintln!("  SCANNER TRADE FAILED: {log}");
+                                if !is_insufficient_balance_error(&e) && !is_stale_signal_error(&e) {
+                                    let alert = format!(
+                                        "Scanner trade failed ({}):\n```\n{}\n```",
+                                        question, log
+                                    );
+                                    if let Err(ae) = send_error_alert(&alert).await {
+                                        eprintln!("Failed to send scanner trade alert: {ae:#}");
+                                    }
+                                }
+                            }
+                        }
+                    }
                 } else {
                     total_no_arb += 1;
-                    eprintln!(
-                        "  NO ARB: {} | ask: {:.1}c + {:.1}c = {:.1}c | bid sum: {:.1}c",
-                        question,
-                        a1 * 100.0,
-                        a2 * 100.0,
-                        ask_sum_cents,
-                        bid_sum_cents,
-                    );
                 }
 
                 // Rate limit: ~5 requests per second (2 per market)
