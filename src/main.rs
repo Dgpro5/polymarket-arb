@@ -59,6 +59,37 @@ static LAST_DETECTION_MS: AtomicI64 = AtomicI64::new(0);
 /// `false` = idle, `true` = trade in progress.
 static TRADE_IN_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Maximum number of asset IDs per WebSocket connection.
+/// Polymarket doesn't document a hard limit, but large subscription
+/// messages can be rejected. 200 assets = 100 binary markets per connection.
+const WS_ASSETS_PER_CONNECTION: usize = 200;
+
+/// How often (seconds) the multi-market WS refreshes its market list
+/// to discover newly created markets.
+const MARKET_REFRESH_INTERVAL_SECS: u64 = 5 * 60;
+
+// ── Multi-market WebSocket state ─────────────────────────────────────────────
+
+/// One side of a binary market — tracked per asset_id.
+#[derive(Debug, Clone)]
+struct AssetSide {
+    condition_id: String,
+    slug: String,
+    end_ts: i64,
+    /// The other asset_id in this binary pair.
+    peer_asset_id: String,
+    outcome: String,
+    /// Best ask from the latest WS update (what we'd pay to BUY).
+    best_ask: Option<f64>,
+    last_update_ms: i64,
+}
+
+/// Shared state for the multi-market WebSocket monitor.
+struct MultiMarketState {
+    /// asset_id → side info (each binary market has two entries).
+    assets: HashMap<String, AssetSide>,
+}
+
 #[derive(Debug, Clone)]
 struct Candle {
     start_ms: i64,
