@@ -37,6 +37,7 @@ const DATA_DIR: &str = "data";
 const LATEST_PATH: &str = "data/btc_updown_5m_latest.json";
 const CSV_PATH: &str = "data/btc_updown_5m_candles.csv";
 const REDEMPTIONS_PATH: &str = "data/pending_redemptions.json";
+const HOT_MARKETS_PATH: &str = "data/hot_markets.json";
 const DISCORD_WEBHOOK_URL: &str = "https://discord.com/api/webhooks/1473284259363164211/4sgTuuoGlwS4OyJ5x6-QmpPA_Q1gvsIZB9EZrb9zWX6qyA0LMQklz3IupBfINPVnpsMZ";
 const ERROR_DISCORD_WEBHOOK_URL: &str = "https://discord.com/api/webhooks/1475092817654055084/_mr0tTCdzyyoJtTBwNqE6KYj6SQ0XEegZFv4j5PejJ0vq2i1Vlt0oi7IFmeAt12j0TQW";
 const DETECTION_COOLDOWN_MS: i64 = 5_000; // 5 seconds — prevent rapid sequential trades
@@ -63,32 +64,6 @@ static TRADE_IN_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 /// Polymarket doesn't document a hard limit, but large subscription
 /// messages can be rejected. 200 assets = 100 binary markets per connection.
 const WS_ASSETS_PER_CONNECTION: usize = 200;
-
-/// How often (seconds) the multi-market WS refreshes its market list
-/// to discover newly created markets.
-const MARKET_REFRESH_INTERVAL_SECS: u64 = 5 * 60;
-
-// ── Multi-market WebSocket state ─────────────────────────────────────────────
-
-/// One side of a binary market — tracked per asset_id.
-#[derive(Debug, Clone)]
-struct AssetSide {
-    condition_id: String,
-    slug: String,
-    end_ts: i64,
-    /// The other asset_id in this binary pair.
-    peer_asset_id: String,
-    outcome: String,
-    /// Best ask from the latest WS update (what we'd pay to BUY).
-    best_ask: Option<f64>,
-    last_update_ms: i64,
-}
-
-/// Shared state for the multi-market WebSocket monitor.
-struct MultiMarketState {
-    /// asset_id → side info (each binary market has two entries).
-    assets: HashMap<String, AssetSide>,
-}
 
 #[derive(Debug, Clone)]
 struct Candle {
@@ -193,6 +168,99 @@ fn add_pending_redemption(slug: &str, condition_id: &str, end_ts: i64) {
         redeem_after_ts: end_ts + 900, // +15 minutes for oracle confirmation
     });
     save_pending_redemptions(&redemptions);
+}
+
+// ── Hot Markets — near-miss tracking for WebSocket promotion ──────────────────
+//
+// When a market gets close to arb (REST book sum >= 100c but was detected as
+// promising) we record a "hit".  Once hit_count >= 2 the market is promoted to
+// the hot-markets WebSocket monitor for low-latency price streaming.  Expired
+// markets (past end_ts) are pruned on every load.
+
+/// Minimum hits before a near-miss market gets promoted to the WS watchlist.
+const HOT_MARKET_MIN_HITS: u32 = 2;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HotMarket {
+    /// Human-readable market question / slug.
+    question: String,
+    condition_id: String,
+    /// The two CLOB token (asset) IDs for this binary market.
+    asset_ids: [String; 2],
+    /// Outcome labels matching asset_ids order (e.g. ["Yes","No"]).
+    outcomes: [String; 2],
+    /// Unix timestamp (seconds) when this market expires / resolves.
+    end_ts: i64,
+    /// Number of times the scanner detected a near-miss on this market.
+    hit_count: u32,
+    /// Last sum_cents value we saw (for logging).
+    last_sum_cents: f64,
+    /// Unix timestamp (seconds) of the most recent hit.
+    last_hit_ts: i64,
+}
+
+fn load_hot_markets() -> Vec<HotMarket> {
+    let markets: Vec<HotMarket> = match fs::read_to_string(HOT_MARKETS_PATH) {
+        Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    // Prune expired markets on every load.
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    markets.into_iter().filter(|m| m.end_ts > now_secs).collect()
+}
+
+fn save_hot_markets(markets: &[HotMarket]) {
+    if let Ok(json) = serde_json::to_string_pretty(markets) {
+        let _ = fs::write(HOT_MARKETS_PATH, json);
+    }
+}
+
+/// Record a near-miss for a market.  If the market already exists, increment
+/// hit_count; otherwise insert a new entry with hit_count=1.
+fn record_near_miss(
+    question: &str,
+    condition_id: &str,
+    asset_ids: [&str; 2],
+    outcomes: [&str; 2],
+    end_ts: i64,
+    sum_cents: f64,
+) {
+    let mut markets = load_hot_markets();
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    if let Some(existing) = markets.iter_mut().find(|m| m.condition_id == condition_id) {
+        existing.hit_count += 1;
+        existing.last_sum_cents = sum_cents;
+        existing.last_hit_ts = now_secs;
+    } else {
+        markets.push(HotMarket {
+            question: question.to_string(),
+            condition_id: condition_id.to_string(),
+            asset_ids: [asset_ids[0].to_string(), asset_ids[1].to_string()],
+            outcomes: [outcomes[0].to_string(), outcomes[1].to_string()],
+            end_ts,
+            hit_count: 1,
+            last_sum_cents: sum_cents,
+            last_hit_ts: now_secs,
+        });
+    }
+
+    save_hot_markets(&markets);
+}
+
+/// Returns hot markets that have been seen enough times (>= HOT_MARKET_MIN_HITS)
+/// and are eligible for WS monitoring.
+fn get_promotable_hot_markets() -> Vec<HotMarket> {
+    load_hot_markets()
+        .into_iter()
+        .filter(|m| m.hit_count >= HOT_MARKET_MIN_HITS)
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -342,6 +410,11 @@ async fn run() -> Result<()> {
     // Ensure the pending redemptions file exists
     if !std::path::Path::new(REDEMPTIONS_PATH).exists() {
         fs::write(REDEMPTIONS_PATH, "[]").context("create pending redemptions file")?;
+    }
+
+    // Ensure the hot markets file exists
+    if !std::path::Path::new(HOT_MARKETS_PATH).exists() {
+        fs::write(HOT_MARKETS_PATH, "[]").context("create hot markets file")?;
     }
 
     // Scan all active markets for arbitrage opportunities on startup (no wallet yet)
@@ -613,6 +686,64 @@ async fn run() -> Result<()> {
             eprintln!("Background scanner: starting periodic scan...");
             if let Err(e) = scan_all_markets(Some(&scan_wallet)).await {
                 eprintln!("Background scanner error: {e:#}");
+            }
+        }
+    });
+
+    // Background task: WebSocket monitor for "hot" markets (near-miss promoted).
+    // Connects to the CLOB WS and subscribes to asset IDs of markets that have
+    // been flagged >= HOT_MARKET_MIN_HITS times by the scanner.  Provides low-
+    // latency arb detection on markets most likely to dip below 100c.
+    let hot_ws_wallet = Arc::clone(&wallet);
+    tokio::spawn(async move {
+        // Give the first scan a chance to populate hot_markets.json.
+        tokio::time::sleep(Duration::from_secs(SCAN_INTERVAL_SECS + 5)).await;
+
+        let mut ws_backoff = 2u64;
+        loop {
+            let hot = get_promotable_hot_markets();
+            if hot.is_empty() {
+                // Nothing to watch yet — check again later.
+                tokio::time::sleep(Duration::from_secs(SCAN_INTERVAL_SECS)).await;
+                ws_backoff = 2;
+                continue;
+            }
+
+            // Collect asset IDs (capped at WS_ASSETS_PER_CONNECTION).
+            let mut asset_ids: Vec<String> = Vec::new();
+            let mut watched: Vec<HotMarket> = Vec::new();
+            for m in &hot {
+                if asset_ids.len() + 2 > WS_ASSETS_PER_CONNECTION {
+                    break;
+                }
+                asset_ids.push(m.asset_ids[0].clone());
+                asset_ids.push(m.asset_ids[1].clone());
+                watched.push(m.clone());
+            }
+
+            eprintln!(
+                "Hot-market WS: connecting with {} markets ({} assets), min hits={}",
+                watched.len(),
+                asset_ids.len(),
+                HOT_MARKET_MIN_HITS,
+            );
+            for m in &watched {
+                eprintln!(
+                    "  - {} (hits={}, last_sum={:.1}c, end_ts={})",
+                    m.question, m.hit_count, m.last_sum_cents, m.end_ts,
+                );
+            }
+
+            match run_hot_market_ws(&hot_ws_wallet, &asset_ids, &watched).await {
+                Ok(_) => {
+                    ws_backoff = 2;
+                    // WS closed normally (e.g. all markets expired) — reload and reconnect.
+                }
+                Err(e) => {
+                    eprintln!("Hot-market WS error: {e:#}. Reconnecting in {ws_backoff}s...");
+                    tokio::time::sleep(Duration::from_secs(ws_backoff)).await;
+                    ws_backoff = (ws_backoff * 2).min(60);
+                }
             }
         }
     });
@@ -893,6 +1024,18 @@ async fn scan_all_markets(wallet: Option<&Arc<TradingWallet>>) -> Result<()> {
                     .and_then(|l| l.size.parse::<f64>().ok())
                     .unwrap_or(0.0);
 
+                // Extract market metadata (needed for both trades and near-miss tracking).
+                let condition_id = market
+                    .get("conditionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let end_ts = market
+                    .get("endDate")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.timestamp())
+                    .unwrap_or(0);
+
                 // Arb exists when best_ask_1 + best_ask_2 < 100c
                 // (i.e. we can BUY both sides for less than the $1 payout)
                 if ask_sum_cents < 100.0 {
@@ -938,16 +1081,6 @@ async fn scan_all_markets(wallet: Option<&Arc<TradingWallet>>) -> Result<()> {
                                     .get("slug")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("unknown");
-                                let condition_id = market
-                                    .get("conditionId")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
-                                let end_ts = market
-                                    .get("endDate")
-                                    .and_then(|v| v.as_str())
-                                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                                    .map(|dt| dt.timestamp())
-                                    .unwrap_or(0);
 
                                 let fill_note = if details.up_filled == details.requested_shares
                                     && details.down_filled == details.requested_shares
@@ -986,6 +1119,25 @@ async fn scan_all_markets(wallet: Option<&Arc<TradingWallet>>) -> Result<()> {
                             Err(e) => {
                                 let log = format!("{:#}", e);
                                 eprintln!("  SCANNER TRADE FAILED: {log}");
+
+                                // REST book rejected — this market was promising
+                                // enough to trigger a trade but the real spread
+                                // was >= 100c.  Record it as a near-miss.
+                                if is_stale_signal_error(&e) && !condition_id.is_empty() && end_ts > 0 {
+                                    record_near_miss(
+                                        question,
+                                        condition_id,
+                                        [&*token_ids[0], &*token_ids[1]],
+                                        [&*outcomes[0], &*outcomes[1]],
+                                        end_ts,
+                                        ask_sum_cents,
+                                    );
+                                    eprintln!(
+                                        "  HOT MARKET HIT (trade rejected): {} | sum {:.1}c",
+                                        question, ask_sum_cents,
+                                    );
+                                }
+
                                 if !is_insufficient_balance_error(&e) && !is_stale_signal_error(&e) {
                                     let alert = format!(
                                         "Scanner trade failed ({}):\n```\n{}\n```",
@@ -1000,6 +1152,24 @@ async fn scan_all_markets(wallet: Option<&Arc<TradingWallet>>) -> Result<()> {
                     }
                 } else {
                     total_no_arb += 1;
+
+                    // Near-miss: sum is close to 100c (within 3c).
+                    // These markets are likely to dip into arb territory
+                    // — track them for potential WS promotion.
+                    if ask_sum_cents <= 103.0 && !condition_id.is_empty() && end_ts > 0 {
+                        record_near_miss(
+                            question,
+                            condition_id,
+                            [&*token_ids[0], &*token_ids[1]],
+                            [&*outcomes[0], &*outcomes[1]],
+                            end_ts,
+                            ask_sum_cents,
+                        );
+                        eprintln!(
+                            "  NEAR-MISS: {} | sum {:.1}c (within 3c of arb)",
+                            question, ask_sum_cents,
+                        );
+                    }
                 }
 
                 // Rate limit: ~5 requests per second (2 per market)
@@ -1190,6 +1360,371 @@ async fn run_socket(
 
     Ok(())
 }
+
+// ── Hot-market WebSocket monitor ──────────────────────────────────────────────
+//
+// Subscribes to asset IDs of markets promoted from the near-miss tracker.
+// Streams best_ask prices and triggers execute_arbitrage_trade when the sum
+// of both sides drops below the profitability threshold.
+
+/// Tracks live best-ask state per asset, grouped by market.
+struct HotAssetState {
+    /// The other asset_id in this binary pair.
+    peer_asset_id: String,
+    /// Market metadata for this asset.
+    question: String,
+    condition_id: String,
+    end_ts: i64,
+    outcomes: [String; 2],
+    asset_ids: [String; 2],
+    /// Best ask from the latest WS update.
+    best_ask: Option<f64>,
+}
+
+/// How often (seconds) the hot-market WS refreshes its market list
+/// to drop expired markets and pick up newly promoted ones.
+const HOT_WS_REFRESH_SECS: u64 = 5 * 60;
+
+async fn run_hot_market_ws(
+    wallet: &Arc<TradingWallet>,
+    asset_ids: &[String],
+    watched: &[HotMarket],
+) -> Result<()> {
+    let (ws_stream, _) = connect_async(CLOB_WS_URL)
+        .await
+        .context("hot-market WS connect")?;
+    let (mut write, mut read) = ws_stream.split();
+
+    let subscribe_msg = json!({
+        "type": "market",
+        "assets_ids": asset_ids
+    })
+    .to_string();
+    write
+        .send(Message::Text(subscribe_msg))
+        .await
+        .context("hot-market WS subscribe")?;
+
+    // Build a lookup table: asset_id → HotAssetState.
+    let mut assets: HashMap<String, HotAssetState> = HashMap::new();
+    for m in watched {
+        assets.insert(
+            m.asset_ids[0].clone(),
+            HotAssetState {
+                peer_asset_id: m.asset_ids[1].clone(),
+                question: m.question.clone(),
+                condition_id: m.condition_id.clone(),
+                end_ts: m.end_ts,
+                outcomes: m.outcomes.clone(),
+                asset_ids: m.asset_ids.clone(),
+                best_ask: None,
+            },
+        );
+        assets.insert(
+            m.asset_ids[1].clone(),
+            HotAssetState {
+                peer_asset_id: m.asset_ids[0].clone(),
+                question: m.question.clone(),
+                condition_id: m.condition_id.clone(),
+                end_ts: m.end_ts,
+                outcomes: m.outcomes.clone(),
+                asset_ids: m.asset_ids.clone(),
+                best_ask: None,
+            },
+        );
+    }
+
+    let refresh_deadline = tokio::time::Instant::now() + Duration::from_secs(HOT_WS_REFRESH_SECS);
+
+    loop {
+        tokio::select! {
+            msg = read.next() => {
+                let Some(msg) = msg else { break };
+                match msg {
+                    Ok(Message::Text(text)) => {
+                        match text.as_str() {
+                            "ping" => {
+                                write.send(Message::Text("pong".to_string())).await.ok();
+                                continue;
+                            }
+                            "pong" | "NO NEW ASSETS" => continue,
+                            _ => {}
+                        }
+                        if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                            handle_hot_market_messages(wallet, &mut assets, &value).await;
+                        }
+                    }
+                    Ok(Message::Ping(data)) => {
+                        write.send(Message::Pong(data)).await.ok();
+                    }
+                    Ok(Message::Close(_)) => break,
+                    Ok(_) => {}
+                    Err(e) => return Err(anyhow!("hot-market WS error: {e}")),
+                }
+            }
+            _ = tokio::time::sleep_until(refresh_deadline) => {
+                // Time to refresh — close this connection so the outer loop
+                // reloads the hot-market list and reconnects.
+                eprintln!("Hot-market WS: refresh interval reached, reconnecting...");
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Process a WS message (possibly batched) for hot-market monitoring.
+async fn handle_hot_market_messages(
+    wallet: &Arc<TradingWallet>,
+    assets: &mut HashMap<String, HotAssetState>,
+    value: &Value,
+) {
+    if let Some(arr) = value.as_array() {
+        for item in arr {
+            handle_hot_market_message_single(wallet, assets, item).await;
+        }
+        return;
+    }
+    if let Some(data) = value.get("data") {
+        if let Some(arr) = data.as_array() {
+            for item in arr {
+                handle_hot_market_message_single(wallet, assets, item).await;
+            }
+            return;
+        }
+        if data.is_object() {
+            handle_hot_market_message_single(wallet, assets, data).await;
+            return;
+        }
+    }
+    handle_hot_market_message_single(wallet, assets, value).await;
+}
+
+/// Handle a single WS event for the hot-market monitor.
+/// Updates the best_ask for the asset and checks for arb opportunities.
+async fn handle_hot_market_message_single(
+    wallet: &Arc<TradingWallet>,
+    assets: &mut HashMap<String, HotAssetState>,
+    value: &Value,
+) {
+    let event_type = match value.get("event_type").and_then(|v| v.as_str()) {
+        Some(t) => t,
+        None => return,
+    };
+
+    // Extract best_ask from relevant event types.
+    let (asset_id, best_ask) = match event_type {
+        "best_bid_ask" => {
+            let id = match value.get("asset_id").and_then(|v| v.as_str()) {
+                Some(id) => id.to_string(),
+                None => return,
+            };
+            let ask = value
+                .get("best_ask")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok());
+            match ask {
+                Some(a) => (id, a),
+                None => return,
+            }
+        }
+        "book" => {
+            let id = match value.get("asset_id").and_then(|v| v.as_str()) {
+                Some(id) => id.to_string(),
+                None => return,
+            };
+            let asks = value
+                .get("asks")
+                .or_else(|| value.get("sells"))
+                .and_then(|v| v.as_array());
+            let best_ask = asks
+                .and_then(|arr| {
+                    arr.iter()
+                        .filter_map(|e| e.get("price").and_then(|v| v.as_str()))
+                        .filter_map(|s| s.parse::<f64>().ok())
+                        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                });
+            match best_ask {
+                Some(a) => (id, a),
+                None => return,
+            }
+        }
+        _ => return,
+    };
+
+    // Update the asset's best_ask and extract metadata.
+    // Split into two borrows to satisfy the borrow checker.
+    let (peer_id, question, condition_id, end_ts, asset_ids_pair, outcomes) = {
+        let state = match assets.get_mut(&asset_id) {
+            Some(s) => s,
+            None => return,
+        };
+        state.best_ask = Some(best_ask);
+        (
+            state.peer_asset_id.clone(),
+            state.question.clone(),
+            state.condition_id.clone(),
+            state.end_ts,
+            state.asset_ids.clone(),
+            state.outcomes.clone(),
+        )
+    };
+
+    // Now we can immutably borrow `assets` to read the peer's best_ask.
+    let peer_ask = match assets.get(&peer_id).and_then(|s| s.best_ask) {
+        Some(a) => a,
+        None => return,
+    };
+
+    // Check if market has expired.
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    if now_secs >= end_ts {
+        return;
+    }
+
+    // Round to tick size and compute sum.
+    let ask1 = (best_ask * 100.0).round() / 100.0;
+    let ask2 = (peer_ask * 100.0).round() / 100.0;
+    let sum_cents = (ask1 + ask2) * 100.0;
+
+    // Fetch fee rate for dynamic profitability threshold.
+    // Use a conservative fallback of 1000bps (10%) if fetch fails.
+    let fee_bps = {
+        let client = Client::new();
+        get_fee_rate(&client, &asset_ids_pair[0])
+            .await
+            .unwrap_or(1000)
+    };
+    let profit_threshold = if fee_bps > 0 {
+        100.0 / (1.0 + fee_bps as f64 / 10000.0)
+    } else {
+        MIN_PROFIT_THRESHOLD_FALLBACK
+    };
+
+    if sum_cents >= profit_threshold {
+        return;
+    }
+
+    // ── Arb detected on hot market! ──────────────────────────────────────
+    // Use the trade lock to prevent concurrent trades.
+    if TRADE_IN_PROGRESS
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return;
+    }
+
+    // Cooldown gate.
+    let now = now_ms();
+    let last = LAST_DETECTION_MS.load(Ordering::Relaxed);
+    if now - last < DETECTION_COOLDOWN_MS {
+        TRADE_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+        return;
+    }
+    LAST_DETECTION_MS.store(now, Ordering::Relaxed);
+
+    let edge = 100.0 - sum_cents;
+    eprintln!(
+        "HOT-MARKET ARB: {} | {:.1}c + {:.1}c = {:.1}c (edge +{:.1}c) | fee={}bps",
+        question,
+        ask1 * 100.0,
+        ask2 * 100.0,
+        sum_cents,
+        edge,
+        fee_bps,
+    );
+
+    let trade_result = execute_arbitrage_trade(
+        wallet,
+        &asset_ids_pair[0],
+        &asset_ids_pair[1],
+        ask1,
+        ask2,
+        ask1,
+        ask2,
+        sum_cents,
+        fee_bps,
+    )
+    .await;
+
+    LAST_DETECTION_MS.store(now_ms(), Ordering::Relaxed);
+    TRADE_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    match trade_result {
+        Ok((result, details)) => {
+            let fill_note = if details.up_filled == details.requested_shares
+                && details.down_filled == details.requested_shares
+            {
+                "full fill".to_string()
+            } else {
+                format!(
+                    "partial — side1 {}/{}, side2 {}/{}",
+                    details.up_filled, details.requested_shares,
+                    details.down_filled, details.requested_shares
+                )
+            };
+            let embed = json!({
+                "title": "Hot-Market Trade Executed",
+                "color": 0xE67E22,
+                "fields": [
+                    { "name": "Market", "value": &question, "inline": false },
+                    { "name": "Ask 1", "value": format!("{:.2}c", ask1 * 100.0), "inline": true },
+                    { "name": "Ask 2", "value": format!("{:.2}c", ask2 * 100.0), "inline": true },
+                    { "name": "Sum / Edge", "value": format!("{:.2}c / +{:.2}c", sum_cents, edge), "inline": true },
+                    { "name": "Shares", "value": format!("{}", result.shares_bought), "inline": true },
+                    { "name": "Total Spent", "value": format!("${:.4}", result.total_spent), "inline": true },
+                    { "name": "Fill", "value": fill_note, "inline": true },
+                    { "name": "Balance After", "value": format!("${:.4}", details.balance_after), "inline": true },
+                ],
+                "footer": { "text": format!("Hot-market WS | {}", condition_id) }
+            });
+            if let Err(e) = send_discord_embed(embed).await {
+                eprintln!("Discord hot-market embed failed: {e:#}");
+            }
+
+            if !condition_id.is_empty() {
+                add_pending_redemption(&question, &condition_id, end_ts);
+            }
+        }
+        Err(e) => {
+            let log = format!("{:#}", e);
+            eprintln!("HOT-MARKET TRADE FAILED: {log}");
+
+            // If it was a stale signal, record another hit to keep the market hot.
+            if is_stale_signal_error(&e) && !condition_id.is_empty() {
+                record_near_miss(
+                    &question,
+                    &condition_id,
+                    [&*asset_ids_pair[0], &*asset_ids_pair[1]],
+                    [&*outcomes[0], &*outcomes[1]],
+                    end_ts,
+                    sum_cents,
+                );
+            }
+
+            if !is_insufficient_balance_error(&e) && !is_stale_signal_error(&e) {
+                let alert = format!(
+                    "Hot-market trade failed ({}):\n```\n{}\n```",
+                    question, log
+                );
+                if let Err(ae) = send_error_alert(&alert).await {
+                    eprintln!("Failed to send hot-market trade alert: {ae:#}");
+                }
+            }
+        }
+    }
+}
+
+// ── Original BTC 5-minute market WS handler ──────────────────────────────────
 
 async fn handle_clob_message(
     state: &Arc<Mutex<MarketState>>,
@@ -1576,6 +2111,26 @@ async fn print_up_down(
                 Err(e) => {
                     let log = format!("{:#}", e);
                     eprintln!("TRADE FAILED: {log}");
+
+                    // WS signalled arb but REST book rejected — record near-miss.
+                    if is_stale_signal_error(&e) && !state.condition_id.is_empty() {
+                        let outcomes: Vec<&str> = state
+                            .asset_to_outcome
+                            .values()
+                            .map(|s| s.as_str())
+                            .collect();
+                        if outcomes.len() == 2 {
+                            record_near_miss(
+                                &state.market_slug,
+                                &state.condition_id,
+                                [&*up_asset, &*down_asset],
+                                [outcomes[0], outcomes[1]],
+                                state.end_ts,
+                                sum_cents,
+                            );
+                        }
+                    }
+
                     // Only send Discord alerts for unexpected errors, not stale-signal
                     // "no arb" rejections (REST book sum >= 100c) or insufficient balance.
                     if !is_insufficient_balance_error(&e) && !is_stale_signal_error(&e) {
