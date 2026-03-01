@@ -685,13 +685,14 @@ async fn run() -> Result<()> {
 /// Scans all active Polymarket events for binary (YES/NO or UP/DOWN) arbitrage.
 async fn scan_all_markets() -> Result<()> {
     eprintln!("=== Polymarket Arbitrage Scanner ===");
-    eprintln!("Fetching all active events...\n");
+    eprintln!("Fetching active events (resolving within 7 days)...\n");
 
     let client = Client::new();
     let mut offset = 0u64;
     let limit = 100u64;
     let mut total_markets = 0u64;
     let mut total_binary = 0u64;
+    let mut total_skipped_date = 0u64;
     let mut total_no_liquidity = 0u64;
     let mut total_no_arb = 0u64;
     let mut opportunities: Vec<(String, String, f64, f64, f64, f64, f64)> = Vec::new();
@@ -765,6 +766,23 @@ async fn scan_all_markets() -> Result<()> {
                 }
 
                 total_binary += 1;
+
+                // Only markets resolving within 7 days — skip long-dated ones
+                // whose books are wide and illiquid.
+                let within_window = match market.get("endDate").and_then(|v| v.as_str()) {
+                    Some(end_date_str) => match chrono::DateTime::parse_from_rfc3339(end_date_str) {
+                        Ok(end_dt) => {
+                            let days_until = end_dt.signed_duration_since(chrono::Utc::now()).num_days();
+                            days_until >= 0 && days_until <= 7
+                        }
+                        Err(_) => false,
+                    },
+                    None => false,
+                };
+                if !within_window {
+                    total_skipped_date += 1;
+                    continue;
+                }
 
                 // Fetch CLOB order books for both tokens
                 let (book1, book2) = tokio::join!(
@@ -866,8 +884,8 @@ async fn scan_all_markets() -> Result<()> {
     // ── Summary ──────────────────────────────────────────────────────────────
     eprintln!("\n=== Scan Complete ===");
     eprintln!(
-        "Total markets: {} | Binary (YES/NO or UP/DOWN): {} | No liquidity: {} | No arb: {} | Arb found: {}",
-        total_markets, total_binary, total_no_liquidity, total_no_arb, opportunities.len()
+        "Total markets: {} | Binary: {} | Skipped (>7d): {} | No liquidity: {} | No arb: {} | Arb found: {}",
+        total_markets, total_binary, total_skipped_date, total_no_liquidity, total_no_arb, opportunities.len()
     );
 
     if opportunities.is_empty() {
