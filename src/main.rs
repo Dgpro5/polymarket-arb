@@ -1620,9 +1620,14 @@ async fn execute_arbitrage_trade(
     }
 
     // ── Order book (REST) — depth sizing + liquidity verification ───────
-    let up_book = get_order_book(&client, up_asset_id).await?;
+    // Fetch both books in parallel to minimize latency between signal and trade.
+    let (up_book, down_book) = tokio::join!(
+        get_order_book(&client, up_asset_id),
+        get_order_book(&client, down_asset_id),
+    );
+    let up_book = up_book?;
+    let down_book = down_book?;
     let up_depth = calculate_total_size(&up_book.asks)?;
-    let down_book = get_order_book(&client, down_asset_id).await?;
     let down_depth = calculate_total_size(&down_book.asks)?;
 
     // Verify both sides have actual ask liquidity on the REST book.
@@ -1708,14 +1713,16 @@ async fn execute_arbitrage_trade(
         cost_per_pair * 100.0, cost_per_pair * buy_shares as f64
     );
 
-    let up_order = build_order_request(
-        wallet, up_asset_id, buy_shares, up_order_price, "BUY", fee_bps, up_salt, "FAK", 0,
-    )
-    .await?;
-    let down_order = build_order_request(
-        wallet, down_asset_id, buy_shares, down_order_price, "BUY", fee_bps, down_salt, "FAK", 0,
-    )
-    .await?;
+    let (up_order, down_order) = tokio::join!(
+        build_order_request(
+            wallet, up_asset_id, buy_shares, up_order_price, "BUY", fee_bps, up_salt, "FAK", 0,
+        ),
+        build_order_request(
+            wallet, down_asset_id, buy_shares, down_order_price, "BUY", fee_bps, down_salt, "FAK", 0,
+        ),
+    );
+    let up_order = up_order?;
+    let down_order = down_order?;
 
     // ═══════════════════════════════════════════════════════════════════════
     //  PHASE 2: Submit BOTH in a single batch request.
