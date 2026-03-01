@@ -783,7 +783,10 @@ async fn scan_all_markets() -> Result<()> {
 
                 let ask1: Option<f64> = book1.asks.first().and_then(|l| l.price.parse().ok());
                 let ask2: Option<f64> = book2.asks.first().and_then(|l| l.price.parse().ok());
+                let bid1: Option<f64> = book1.bids.first().and_then(|l| l.price.parse().ok());
+                let bid2: Option<f64> = book2.bids.first().and_then(|l| l.price.parse().ok());
 
+                // Need asks on both sides — that's what we pay with FAK
                 let (a1, a2) = match (ask1, ask2) {
                     (Some(a), Some(b)) => (a, b),
                     _ => {
@@ -792,10 +795,14 @@ async fn scan_all_markets() -> Result<()> {
                     }
                 };
 
-                let sum = a1 + a2;
-                let sum_cents = sum * 100.0;
+                let ask_sum = a1 + a2;
+                let ask_sum_cents = ask_sum * 100.0;
+                let bid_sum_cents = match (bid1, bid2) {
+                    (Some(b1), Some(b2)) => (b1 + b2) * 100.0,
+                    _ => f64::NAN,
+                };
 
-                // Get depth for display
+                // Get depth for display (ask-side depth — what we can buy)
                 let depth1 = book1
                     .asks
                     .first()
@@ -807,34 +814,38 @@ async fn scan_all_markets() -> Result<()> {
                     .and_then(|l| l.size.parse::<f64>().ok())
                     .unwrap_or(0.0);
 
-                if sum_cents < 100.0 {
-                    let edge = 100.0 - sum_cents;
+                // Arb exists when best_ask_1 + best_ask_2 < 100c
+                // (i.e. we can BUY both sides for less than the $1 payout)
+                if ask_sum_cents < 100.0 {
+                    let edge = 100.0 - ask_sum_cents;
                     opportunities.push((
                         event_title.to_string(),
                         question.to_string(),
                         a1 * 100.0,
                         a2 * 100.0,
-                        sum_cents,
+                        ask_sum_cents,
                         edge,
                         depth1.min(depth2),
                     ));
                     eprintln!(
-                        "  ARB FOUND: {} | {:.1}c + {:.1}c = {:.1}c (edge +{:.1}c) | depth: {:.0}",
+                        "  ARB FOUND: {} | ask: {:.1}c + {:.1}c = {:.1}c (edge +{:.1}c) | bid sum: {:.1}c | depth: {:.0}",
                         question,
                         a1 * 100.0,
                         a2 * 100.0,
-                        sum_cents,
+                        ask_sum_cents,
                         edge,
+                        bid_sum_cents,
                         depth1.min(depth2),
                     );
                 } else {
                     total_no_arb += 1;
                     eprintln!(
-                        "  NO ARB: {} | {:.1}c + {:.1}c = {:.1}c",
+                        "  NO ARB: {} | ask: {:.1}c + {:.1}c = {:.1}c | bid sum: {:.1}c",
                         question,
                         a1 * 100.0,
                         a2 * 100.0,
-                        sum_cents,
+                        ask_sum_cents,
+                        bid_sum_cents,
                     );
                 }
 
@@ -1626,12 +1637,13 @@ async fn execute_arbitrage_trade(
     let down_book_price = down_best_ask.unwrap();
     let book_sum = up_book_price + down_book_price;
 
-    // Validate the arb against the REAL order book, not the WS.
-    // The WS can report stale/phantom prices (e.g. 12c+78c=90c) while
-    // the actual book has asks at 99c+99c.  No real arb exists there.
+    // Validate the arb against the REAL order book ask prices (what we
+    // actually pay with FAK).  The WS can report stale/phantom prices
+    // while the actual book has different asks.  No real arb exists if
+    // best_ask_1 + best_ask_2 >= 100c.
     if book_sum >= 1.0 {
         return Err(anyhow!(
-            "REST book asks sum to {:.2}c (UP {:.2}c + DOWN {:.2}c) >= 100c. WS signal is stale — no real arb.",
+            "REST book asks sum to {:.2}c (UP {:.2}c + DOWN {:.2}c) >= 100c. No real arb at the spread.",
             book_sum * 100.0, up_book_price * 100.0, down_book_price * 100.0
         ));
     }
@@ -1680,13 +1692,13 @@ async fn execute_arbitrage_trade(
     // ═══════════════════════════════════════════════════════════════════════
     //  PHASE 1: Pre-build & sign BOTH orders as FAK before sending.
     //  No network calls between the two signs — eliminates signing delay.
-    //  Uses REST book prices so maker_amount accurately reflects the cost.
+    //  Uses REST book ask prices so maker_amount accurately reflects the cost.
     // ═══════════════════════════════════════════════════════════════════════
     let up_salt = now_ms() as u64;
     let down_salt = up_salt + 1;
 
     eprintln!(
-        "Building orders — {} shares × UP {:.2}c + DOWN {:.2}c = {:.2}c/pair, est ${:.4}",
+        "Building FAK orders — {} shares × UP {:.2}c + DOWN {:.2}c = {:.2}c/pair, est ${:.4}",
         buy_shares, up_order_price * 100.0, down_order_price * 100.0,
         cost_per_pair * 100.0, cost_per_pair * buy_shares as f64
     );
@@ -2003,7 +2015,22 @@ async fn get_order_book(client: &Client, token_id: &str) -> Result<OrderBook> {
     let url = format!("{CLOB_API}/book?token_id={}", token_id);
     let resp = client.get(&url).send().await.context("fetch order book")?;
 
-    let book: OrderBook = resp.json().await.context("parse order book")?;
+    let mut book: OrderBook = resp.json().await.context("parse order book")?;
+
+    // CLOB API returns asks in arbitrary/descending order — sort ascending so
+    // asks[0] is the cheapest (best) ask.  Sort bids descending so bids[0] is
+    // the highest (best) bid.
+    book.asks.sort_by(|a, b| {
+        let pa: f64 = a.price.parse().unwrap_or(f64::MAX);
+        let pb: f64 = b.price.parse().unwrap_or(f64::MAX);
+        pa.partial_cmp(&pb).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    book.bids.sort_by(|a, b| {
+        let pa: f64 = a.price.parse().unwrap_or(0.0);
+        let pb: f64 = b.price.parse().unwrap_or(0.0);
+        pb.partial_cmp(&pa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
     Ok(book)
 }
 
