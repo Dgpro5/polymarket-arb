@@ -44,7 +44,7 @@ const DETECTION_COOLDOWN_MS: i64 = 5_000; // 5 seconds — prevent rapid sequent
 /// Stop looking for arb opportunities this many seconds before the window closes.
 /// Near the close, the order book drains and Polymarket rejects one or both legs,
 /// resulting in the "REST book asks sum >= 100c" stale-signal error.
-const WINDOW_CLOSE_CUTOFF_SECS: i64 = 30;
+const WINDOW_CLOSE_CUTOFF_SECS: i64 = 10;
 
 const PRIVATE_KEY_ENV: &str = "PRIVATE_KEY";
 
